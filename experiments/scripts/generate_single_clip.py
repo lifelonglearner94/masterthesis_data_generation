@@ -525,7 +525,7 @@ def create_dynamic_cube(scene: "kb.Scene", config: dict, parameters: dict) -> "k
     return cube
 
 
-def apply_force_impulse(
+def apply_force_impulse_during_simulation(
     simulator: "KubricSimulator",
     cube: "kb.Cube",
     config: dict,
@@ -533,16 +533,20 @@ def apply_force_impulse(
     scene: "kb.Scene"
 ) -> None:
     """
-    Apply force impulse to the cube between frame 1 and 2.
+    Run simulation with force impulse applied between frame 1 and 2.
 
-    This is done by:
-    1. Running simulation for frame 0-1 (object at rest)
-    2. Applying impulse via PyBullet at the end of frame 1
-    3. The remaining simulation (frame 1 onwards) will have the impulse effect
+    The key insight is that we need to run the ENTIRE simulation in one go,
+    but inject the impulse at the right moment during the simulation loop.
 
-    The force is applied at the center of mass using PyBullet's applyExternalForce.
-    Since we want an instantaneous impulse, we convert force to velocity change:
-    impulse = force, velocity_change = impulse / mass
+    Kubric's simulator.run() records keyframes internally and transfers them
+    to Blender at the end. If we call run() twice, the keyframes from the
+    second call overwrite those from the first for overlapping frames, AND
+    any PyBullet state changes made between run() calls are not properly
+    tracked in the animation dictionary.
+
+    Solution: We manually implement the simulation loop with impulse injection,
+    similar to how Kubric's run() method works, but with impulse applied at
+    the correct timestep.
     """
     import pybullet as p
 
@@ -552,53 +556,114 @@ def apply_force_impulse(
 
     # Get PyBullet body ID for the cube
     body_id = cube.linked_objects[simulator]
+    # physics_client property returns the raw pybullet client ID
     physics_client = simulator.physics_client
 
-    # Run simulation up to the impulse frame (frame 0 to apply_frame)
-    # This lets the cube settle on the floor
-    logger.info(f"Running simulation frames 0-{apply_frame} (pre-impulse)...")
-    simulator.run(frame_start=0, frame_end=apply_frame)
+    # Simulation parameters
+    frame_start = 0
+    frame_end = scene.frame_end
+    steps_per_frame = scene.step_rate // scene.frame_rate
+    total_steps = (frame_end - frame_start + 1) * steps_per_frame
 
-    # Calculate velocity change from impulse: Δv = F/m (treating force as impulse in N·s)
-    # For a true impulse, the force value represents the impulse magnitude
-    velocity_change = (
-        force_vector["x"] / mass,
-        force_vector["y"] / mass,
-        force_vector["z"] / mass
-    )
+    logger.info(f"Running simulation frames {frame_start}-{frame_end} "
+                f"({total_steps} steps, {steps_per_frame} steps/frame)")
+    logger.info(f"Impulse will be applied after frame {apply_frame} is recorded")
 
-    # Get current velocity
-    current_vel, current_ang_vel = p.getBaseVelocity(body_id, physicsClientId=physics_client)
+    # Get all body IDs in the simulation using pybullet directly
+    num_bodies = p.getNumBodies(physicsClientId=physics_client)
+    obj_idxs = [
+        p.getBodyUniqueId(i, physicsClientId=physics_client)
+        for i in range(num_bodies)
+    ]
 
-    # Apply impulse by setting new velocity
-    new_velocity = (
-        current_vel[0] + velocity_change[0],
-        current_vel[1] + velocity_change[1],
-        current_vel[2] + velocity_change[2]
-    )
-
-    p.resetBaseVelocity(
-        objectUniqueId=body_id,
-        linearVelocity=new_velocity,
-        angularVelocity=current_ang_vel,
-        physicsClientId=physics_client
-    )
-
-    logger.info(f"Applied impulse at frame {apply_frame}: "
-                f"force=({force_vector['x']:.2f}, {force_vector['y']:.2f}, {force_vector['z']:.2f}) N, "
-                f"Δv=({velocity_change[0]:.2f}, {velocity_change[1]:.2f}, {velocity_change[2]:.2f}) m/s")
-
-    # Store the actual velocity change for ground truth
-    parameters["velocity_change"] = {
-        "x": float(velocity_change[0]),
-        "y": float(velocity_change[1]),
-        "z": float(velocity_change[2])
+    # Animation storage (matches Kubric's internal format)
+    animation = {
+        obj_id: {"position": [], "quaternion": [], "velocity": [], "angular_velocity": []}
+        for obj_id in obj_idxs
     }
 
-    # Continue simulation for remaining frames
-    frame_end = scene.frame_end
-    logger.info(f"Running simulation frames {apply_frame}-{frame_end} (post-impulse)...")
-    simulator.run(frame_start=apply_frame, frame_end=frame_end)
+    impulse_applied = False
+
+    for current_step in range(total_steps):
+        # Record keyframe at the start of each frame
+        if current_step % steps_per_frame == 0:
+            current_frame = current_step // steps_per_frame + frame_start
+
+            for obj_idx in obj_idxs:
+                position, quaternion = simulator.get_position_and_rotation(obj_idx)
+                velocity, angular_velocity = simulator.get_velocities(obj_idx)
+
+                animation[obj_idx]["position"].append(position)
+                animation[obj_idx]["quaternion"].append(quaternion)
+                animation[obj_idx]["velocity"].append(velocity)
+                animation[obj_idx]["angular_velocity"].append(angular_velocity)
+
+            # Apply impulse right after recording the apply_frame keyframe
+            # This means the impulse effect will be visible starting from frame apply_frame+1
+            if current_frame == apply_frame and not impulse_applied:
+                # Calculate velocity change from impulse: Δv = F/m
+                velocity_change = (
+                    force_vector["x"] / mass,
+                    force_vector["y"] / mass,
+                    force_vector["z"] / mass
+                )
+
+                # Get current velocity of the cube
+                current_vel, current_ang_vel = p.getBaseVelocity(
+                    body_id, physicsClientId=physics_client
+                )
+
+                # Apply impulse by setting new velocity
+                new_velocity = (
+                    current_vel[0] + velocity_change[0],
+                    current_vel[1] + velocity_change[1],
+                    current_vel[2] + velocity_change[2]
+                )
+
+                p.resetBaseVelocity(
+                    objectUniqueId=body_id,
+                    linearVelocity=new_velocity,
+                    angularVelocity=current_ang_vel,
+                    physicsClientId=physics_client
+                )
+
+                logger.info(f"Applied impulse at frame {apply_frame}: "
+                           f"force=({force_vector['x']:.2f}, {force_vector['y']:.2f}, {force_vector['z']:.2f}) N, "
+                           f"Δv=({velocity_change[0]:.2f}, {velocity_change[1]:.2f}, {velocity_change[2]:.2f}) m/s")
+
+                # Store the actual velocity change for ground truth
+                parameters["velocity_change"] = {
+                    "x": float(velocity_change[0]),
+                    "y": float(velocity_change[1]),
+                    "z": float(velocity_change[2])
+                }
+
+                impulse_applied = True
+
+        # Step the physics simulation using pybullet directly
+        p.stepSimulation(physicsClientId=physics_client)
+
+    # Map body IDs back to Kubric assets
+    animation = {
+        asset: animation[asset.linked_objects[simulator]]
+        for asset in scene.assets
+        if asset.linked_objects.get(simulator) in obj_idxs
+    }
+
+    # Transfer simulation results to renderer keyframes (same as Kubric's run() does)
+    logger.info("Transferring simulation keyframes to renderer...")
+    for obj in animation.keys():
+        for frame_id in range(frame_end - frame_start + 1):
+            obj.position = animation[obj]["position"][frame_id]
+            obj.quaternion = animation[obj]["quaternion"][frame_id]
+            obj.velocity = animation[obj]["velocity"][frame_id]
+            obj.angular_velocity = animation[obj]["angular_velocity"][frame_id]
+            obj.keyframe_insert("position", frame_id + frame_start)
+            obj.keyframe_insert("quaternion", frame_id + frame_start)
+            obj.keyframe_insert("velocity", frame_id + frame_start)
+            obj.keyframe_insert("angular_velocity", frame_id + frame_start)
+
+    logger.info(f"Simulation complete. Recorded {frame_end - frame_start + 1} keyframes.")
 
 
 def setup_output_directories(output_dir: Path) -> dict:
@@ -860,17 +925,9 @@ def generate_clip(
     # Create dynamic object
     cube = create_dynamic_cube(scene, config, parameters)
 
-    # Setup simulator
-    simulator = KubricSimulator(scene)
-
-    # Apply force impulse between frame 1 and 2
-    # This function handles the phased simulation internally
-    apply_force_impulse(simulator, cube, config, parameters, scene)
-
-    # Note: simulation is now complete (run inside apply_force_impulse)
-    # No need to call simulator.run() again
-
-    # Setup renderer
+    # IMPORTANT: Setup renderer BEFORE simulator
+    # The renderer must be created before simulation so it can observe keyframe changes
+    # when keyframe_insert() is called during/after simulation
     renderer = KubricRenderer(
         scene,
         scratch_dir=str(output_dir / ".scratch"),
@@ -878,6 +935,15 @@ def generate_clip(
         use_denoising=True,
         samples_per_pixel=64,
     )
+
+    # Setup simulator
+    simulator = KubricSimulator(scene)
+
+    # Run simulation with force impulse applied between frame 1 and 2
+    # This function handles the phased simulation internally with proper keyframe recording
+    apply_force_impulse_during_simulation(simulator, cube, config, parameters, scene)
+
+    # Note: simulation is now complete with all keyframes properly transferred to Blender
 
     # Render all outputs
     render_outputs = render_scene(scene, renderer, directories, config)
