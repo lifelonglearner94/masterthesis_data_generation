@@ -486,10 +486,13 @@ def create_dynamic_cube(scene: "kb.Scene", config: dict, parameters: dict) -> "k
     size = parameters["object_size"]
     color = parameters["object_color_rgba"]
 
-    # Random starting position (centered, slightly above floor)
-    start_x = np.random.uniform(-0.5, 0.5)
-    start_y = np.random.uniform(-0.5, 0.5)
-    start_z = size / 2 + 0.01  # Just above floor
+    # Random starting position (centered, exactly resting on floor)
+    # Use a smaller spawn area relative to the arena size
+    arena_size = config["walls"].get("arena_size", 2.5)
+    spawn_range = arena_size * 0.15  # Spawn in central 30% of arena
+    start_x = np.random.uniform(-spawn_range, spawn_range)
+    start_y = np.random.uniform(-spawn_range, spawn_range)
+    start_z = size / 2  # Exactly resting on floor (no gap = no settling)
 
     cube = kb.Cube(
         name="dynamic_cube",
@@ -575,6 +578,26 @@ def apply_force_impulse_during_simulation(
         p.getBodyUniqueId(i, physicsClientId=physics_client)
         for i in range(num_bodies)
     ]
+
+    # PRE-SETTLING PHASE: Run physics briefly to let objects settle,
+    # then reset velocities to zero. This ensures frame 0 is truly at rest.
+    settling_steps = steps_per_frame * 2  # 2 frames worth of settling
+    for _ in range(settling_steps):
+        p.stepSimulation(physicsClientId=physics_client)
+
+    # Reset all dynamic objects to zero velocity after settling
+    for obj_idx in obj_idxs:
+        # Check if this is a dynamic body (not static)
+        body_info = p.getBodyInfo(obj_idx, physicsClientId=physics_client)
+        mass_info = p.getDynamicsInfo(obj_idx, -1, physicsClientId=physics_client)
+        if mass_info[0] > 0:  # mass > 0 means dynamic
+            p.resetBaseVelocity(
+                objectUniqueId=obj_idx,
+                linearVelocity=(0, 0, 0),
+                angularVelocity=(0, 0, 0),
+                physicsClientId=physics_client
+            )
+    logger.info(f"Pre-settling complete. All dynamic objects reset to zero velocity.")
 
     # Animation storage (matches Kubric's internal format)
     animation = {

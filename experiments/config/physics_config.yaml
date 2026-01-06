@@ -17,7 +17,7 @@ video:
 camera:
   type: "static"
   angle_degrees: 45
-  distance: 3.5
+  distance: 12.0     # Increased to see larger arena
   focal_length: 35
   sensor_width: 32
 
@@ -53,19 +53,19 @@ restitution:
 
 # Force impulse settings
 force:
-  # Magnitude range (Newtons)
-  magnitude_min: 5.0
-  magnitude_max: 25.0
+  # Magnitude range (Newtons) - tuned for ~1 second of visible motion
+  magnitude_min: 3.0
+  magnitude_max: 15.0
   # Direction constraints (applied on XY plane primarily)
   apply_at_frame: 1  # Apply force between frame 1 and 2
-  z_component_range: [-2.0, 2.0]  # Small vertical component
+  z_component_range: [-1.0, 1.0]  # Small vertical component
 
 # Wall configuration
 walls:
   enabled: true
   thickness: 0.1
   height: 1.0
-  arena_size: 2.5
+  arena_size: 10.0   # Increased from 2.5m to allow longer sliding distance
   friction: 0.8
   restitution: 0.3
 
