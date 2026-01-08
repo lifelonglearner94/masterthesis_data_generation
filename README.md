@@ -139,6 +139,8 @@ cd /scripts && python manager_benchmark.py \
 
 > 🔄 **Auto-Resume**: If interrupted (even by shutdown), just re-run the same command. The pipeline automatically skips completed clips.
 
+> ⏱️ **ETA Tracking**: The pipeline prints detailed time estimates every 500 clips (or every 30 minutes), using a rolling window of recent clip times for accurate predictions. This shows both recent and overall rates, plus expected completion time.
+
 > ⏱️ **Estimated time**: ~3-4 days with 4 parallel workers (vs ~8-10 days sequential)
 
 Then exit Docker with `exit`.

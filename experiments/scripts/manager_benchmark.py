@@ -621,6 +621,12 @@ def run_production(
     failed = [0]
     start_time = time.perf_counter()
 
+    # Rolling window for recent timing data (for more accurate ETA)
+    recent_times = []  # List of (completion_time, elapsed_since_start)
+    ROLLING_WINDOW_SIZE = 50  # Number of recent clips to use for ETA
+    ETA_REPORT_INTERVAL = 500  # Print detailed ETA every N clips
+    last_eta_report_time = [start_time]  # Last time we printed a detailed ETA
+
     # Create global metadata (only if not resuming or first run)
     metadata_path = output_dir / "metadata.yaml"
     if not metadata_path.exists():
@@ -634,14 +640,22 @@ def run_production(
     # Note: job_ids is already filtered above for resume support
 
     def process_result(result: JobResult) -> None:
-        """Thread-safe result processing."""
+        """Thread-safe result processing with rolling-window ETA estimation."""
         with progress_lock:
             completed[0] += 1
             current = completed[0]
+            now = time.perf_counter()
+            elapsed = now - start_time
 
             if result.success:
+                # Track timing for rolling window ETA
+                recent_times.append((now, result.elapsed_time))
+                # Keep only the last ROLLING_WINDOW_SIZE entries
+                while len(recent_times) > ROLLING_WINDOW_SIZE:
+                    recent_times.pop(0)
+
+                # Basic progress update every 100 clips
                 if current % 100 == 0 or current == 1:
-                    elapsed = time.perf_counter() - start_time
                     rate = current / elapsed if elapsed > 0 else 0
                     remaining = (total_jobs - current) / rate / 3600 if rate > 0 else 0
                     logger.info(
@@ -650,6 +664,53 @@ def run_production(
                         f"Rate: {rate:.2f} clips/s - "
                         f"Est. remaining: {remaining:.1f}h"
                     )
+
+                # Detailed ETA report every ETA_REPORT_INTERVAL clips or every 30 minutes
+                time_since_last_report = now - last_eta_report_time[0]
+                should_report = (
+                    current % ETA_REPORT_INTERVAL == 0 or
+                    time_since_last_report >= 1800  # 30 minutes
+                )
+
+                if should_report and len(recent_times) >= 10:
+                    last_eta_report_time[0] = now
+
+                    # Calculate recent rate from rolling window
+                    recent_elapsed = recent_times[-1][0] - recent_times[0][0]
+                    recent_count = len(recent_times)
+                    recent_rate = (recent_count - 1) / recent_elapsed if recent_elapsed > 0 else 0
+
+                    # Calculate average time per clip from recent window
+                    recent_avg_time = sum(t[1] for t in recent_times) / len(recent_times)
+
+                    # Overall rate for comparison
+                    overall_rate = current / elapsed if elapsed > 0 else 0
+
+                    # ETA based on recent rate (more accurate for current conditions)
+                    remaining_jobs = total_jobs - current
+                    eta_recent_hours = remaining_jobs / recent_rate / 3600 if recent_rate > 0 else 0
+                    eta_overall_hours = remaining_jobs / overall_rate / 3600 if overall_rate > 0 else 0
+
+                    # Calculate completion time
+                    eta_datetime = datetime.now() + timedelta(hours=eta_recent_hours)
+
+                    # Print detailed ETA report
+                    logger.info("")
+                    logger.info("─" * 60)
+                    logger.info("📊 DETAILED ETA REPORT (based on recent performance)")
+                    logger.info("─" * 60)
+                    logger.info(f"  Progress:        {current:,} / {total_jobs:,} clips ({100*current/total_jobs:.1f}%)")
+                    logger.info(f"  Elapsed time:    {elapsed/3600:.2f} hours")
+                    logger.info(f"  ")
+                    logger.info(f"  Recent rate:     {recent_rate:.3f} clips/sec ({recent_avg_time:.1f}s per clip)")
+                    logger.info(f"  Overall rate:    {overall_rate:.3f} clips/sec")
+                    logger.info(f"  ")
+                    logger.info(f"  Remaining:       {remaining_jobs:,} clips")
+                    logger.info(f"  ETA (recent):    {eta_recent_hours:.1f} hours ({eta_recent_hours/24:.1f} days)")
+                    logger.info(f"  ETA (overall):   {eta_overall_hours:.1f} hours ({eta_overall_hours/24:.1f} days)")
+                    logger.info(f"  Expected finish: {eta_datetime.strftime('%Y-%m-%d %H:%M')}")
+                    logger.info("─" * 60)
+                    logger.info("")
             else:
                 failed[0] += 1
                 log_error(error_log_path, result)
