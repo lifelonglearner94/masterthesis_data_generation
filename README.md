@@ -131,10 +131,13 @@ cd /scripts && python manager_benchmark.py \
     --start_job 0 \
     --end_job 16999 \
     --workers 4 \
-    --auto_scale
+    --auto_scale \
+    --no_gif
 ```
 
 > 💡 **Parallel Execution**: Using `--workers 4` with `--auto_scale` keeps the GPU busy while CPUs prepare the next frames. This can reduce total time by 50-70%.
+
+> 🔄 **Auto-Resume**: If interrupted (even by shutdown), just re-run the same command. The pipeline automatically skips completed clips.
 
 > ⏱️ **Estimated time**: ~3-4 days with 4 parallel workers (vs ~8-10 days sequential)
 
@@ -179,7 +182,7 @@ output/dataset_name/
 │   │   └── ...
 │   ├── feature_maps/
 │   │   └── vjepa2_vitl16.npy   # (4096, 1024) float16
-│   ├── preview.gif             # Quick visual preview
+│   ├── preview.gif             # Quick visual preview (if --no_gif not used)
 │   └── ground_truth.json
 ├── clip_00001/
 └── ...
@@ -214,6 +217,8 @@ Edit `experiments/config/physics_config.yaml` to customize physics parameters:
 | `--dry_run` | Metadata only, no rendering |
 | `--workers N` | Parallel workers (default: CPU_COUNT-2). Use 1 for sequential |
 | `--auto_scale` | VRAM-aware throttling: pause submission when GPU memory is high |
+| `--force_restart` | Ignore existing completed clips and regenerate all (disables auto-resume) |
+| `--no_gif` | Skip GIF preview generation (recommended for production) |
 
 ### encode_benchmark_vjepa2.py (Encoding)
 
@@ -279,7 +284,25 @@ uv pip install timm einops opencv-python
 
 ### Resume Interrupted Rendering
 
-Use `--start_job` and `--end_job` to generate specific ranges:
+The pipeline **automatically resumes** from where it left off. Just re-run the exact same command:
+```bash
+# Simply re-run - completed clips are automatically skipped
+cd /scripts && python manager_benchmark.py \
+    --seed 42 \
+    --output_dir /output/friction_dataset_v1 \
+    --workers 4 \
+    --auto_scale
+```
+
+To force regeneration of all clips (ignore existing):
+```bash
+cd /scripts && python manager_benchmark.py \
+    --seed 42 \
+    --output_dir /output/friction_dataset_v1 \
+    --force_restart
+```
+
+To generate only a specific range:
 ```bash
 # Generate clips 5000-9999 only
 cd /scripts && python manager_benchmark.py \

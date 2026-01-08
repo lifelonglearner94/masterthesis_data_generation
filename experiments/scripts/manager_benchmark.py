@@ -117,6 +117,43 @@ def wait_for_vram_available(threshold: float = VRAM_HIGH_THRESHOLD) -> None:
         logger.info(f"VRAM available ({fraction*100:.1f}%), resuming...")
 
 
+def is_job_completed(output_dir: Path, job_id: int) -> bool:
+    """
+    Check if a job has already been completed successfully.
+
+    A job is considered complete if its ground_truth.json file exists,
+    since this file is only written at the very end of successful generation.
+
+    Args:
+        output_dir: Base output directory
+        job_id: The job identifier
+
+    Returns:
+        True if the job is already complete, False otherwise
+    """
+    job_output_dir = output_dir / f"clip_{job_id:05d}"
+    ground_truth_file = job_output_dir / "ground_truth.json"
+    return ground_truth_file.exists()
+
+
+def find_completed_jobs(output_dir: Path, job_ids: List[int]) -> set:
+    """
+    Scan output directory to find all already-completed jobs.
+
+    Args:
+        output_dir: Base output directory
+        job_ids: List of job IDs to check
+
+    Returns:
+        Set of job IDs that are already completed
+    """
+    completed = set()
+    for job_id in job_ids:
+        if is_job_completed(output_dir, job_id):
+            completed.add(job_id)
+    return completed
+
+
 def build_worker_environment() -> dict:
     """
     Build environment dict for worker subprocesses with thread limiting.
@@ -209,6 +246,7 @@ def run_single_job(
     dry_run: bool = False,
     timeout: int = 600,  # 10 minute timeout per job
     worker_env: Optional[dict] = None,
+    no_gif: bool = False,
 ) -> JobResult:
     """
     Execute a single worker script as a subprocess.
@@ -222,6 +260,7 @@ def run_single_job(
         dry_run: If True, run in dry-run mode
         timeout: Maximum time to wait for job completion
         worker_env: Environment dict for subprocess (with thread limits)
+        no_gif: If True, skip GIF preview generation
 
     Returns:
         JobResult with execution details
@@ -241,6 +280,9 @@ def run_single_job(
 
     if dry_run:
         cmd.append("--dry_run")
+
+    if no_gif:
+        cmd.append("--no_gif")
 
     # Use thread-limited environment if provided
     env = worker_env if worker_env is not None else build_worker_environment()
@@ -308,6 +350,7 @@ def run_single_job_with_retry(
     timeout: int = 600,
     worker_env: Optional[dict] = None,
     max_retries: int = 1,
+    no_gif: bool = False,
 ) -> JobResult:
     """
     Execute a job with retry logic for VRAM errors.
@@ -317,7 +360,7 @@ def run_single_job_with_retry(
     """
     result = run_single_job(
         worker_script, output_dir, job_id, seed, physics_config,
-        dry_run, timeout, worker_env
+        dry_run, timeout, worker_env, no_gif
     )
 
     if result.success:
@@ -329,7 +372,7 @@ def run_single_job_with_retry(
         time.sleep(VRAM_RETRY_DELAY)
         return run_single_job_with_retry(
             worker_script, output_dir, job_id, seed, physics_config,
-            dry_run, timeout, worker_env, max_retries - 1
+            dry_run, timeout, worker_env, max_retries - 1, no_gif
         )
 
     return result
@@ -510,6 +553,8 @@ def run_production(
     dry_run: bool = False,
     max_workers: int = 1,
     auto_scale: bool = False,
+    force_restart: bool = False,
+    no_gif: bool = False,
 ) -> None:
     """
     Run the full production dataset generation with pipeline saturation.
@@ -517,6 +562,10 @@ def run_production(
     Uses a bounded process pool pattern to keep workers saturated while
     preventing resource exhaustion. Each worker runs with thread-limited
     environment to avoid CPU contention.
+
+    RESUME SUPPORT: Automatically detects and skips already-completed jobs
+    by checking for the existence of ground_truth.json in each clip directory.
+    This allows the pipeline to resume from where it left off after interruption.
 
     Args:
         worker_script: Path to worker script
@@ -528,10 +577,40 @@ def run_production(
         dry_run: If True, run in dry-run mode
         max_workers: Number of parallel workers
         auto_scale: If True, pause submission when VRAM is high
+        force_restart: If True, ignore existing completed jobs and regenerate all
+        no_gif: If True, skip GIF preview generation (faster for production)
     """
-    total_jobs = end_job - start_job + 1
-    logger.info(f"Starting production run: jobs {start_job} to {end_job} ({total_jobs:,} total)")
+    total_jobs_requested = end_job - start_job + 1
+    logger.info(f"Production run requested: jobs {start_job} to {end_job} ({total_jobs_requested:,} total)")
     logger.info(f"Parallel workers: {max_workers} (auto_scale={auto_scale})")
+
+    # Build full job list
+    all_job_ids = list(range(start_job, end_job + 1))
+
+    # RESUME SUPPORT: Check for already completed jobs
+    if not force_restart:
+        logger.info("Scanning for previously completed jobs (resume mode)...")
+        completed_jobs = find_completed_jobs(output_dir, all_job_ids)
+        num_completed = len(completed_jobs)
+
+        if num_completed > 0:
+            logger.info(f"✓ Found {num_completed:,} already completed jobs - skipping these")
+            job_ids = [j for j in all_job_ids if j not in completed_jobs]
+            logger.info(f"  Resuming with {len(job_ids):,} remaining jobs")
+        else:
+            logger.info("No previously completed jobs found - starting fresh")
+            job_ids = all_job_ids
+    else:
+        logger.warning("Force restart enabled - regenerating ALL jobs (ignoring existing)")
+        job_ids = all_job_ids
+
+    total_jobs = len(job_ids)
+
+    if total_jobs == 0:
+        logger.info("All jobs already completed! Nothing to do.")
+        return
+
+    logger.info(f"Starting generation of {total_jobs:,} clips...")
 
     # Create error log file
     error_log_path = output_dir / "error_log.txt"
@@ -542,14 +621,17 @@ def run_production(
     failed = [0]
     start_time = time.perf_counter()
 
-    # Create global metadata
-    save_global_metadata(output_dir, seed, physics_config, start_job, end_job)
+    # Create global metadata (only if not resuming or first run)
+    metadata_path = output_dir / "metadata.yaml"
+    if not metadata_path.exists():
+        save_global_metadata(output_dir, seed, physics_config, start_job, end_job)
+    else:
+        logger.info(f"Metadata already exists at {metadata_path}, preserving original")
 
     # Build thread-limited environment once
     worker_env = build_worker_environment()
 
-    # Process jobs
-    job_ids = list(range(start_job, end_job + 1))
+    # Note: job_ids is already filtered above for resume support
 
     def process_result(result: JobResult) -> None:
         """Thread-safe result processing."""
@@ -607,6 +689,8 @@ def run_production(
                         dry_run,
                         600,  # timeout
                         worker_env,
+                        1,  # max_retries
+                        no_gif,
                     )
                     futures[future] = job_id
                     pending_count += 1
@@ -659,6 +743,8 @@ def run_production(
                                 dry_run,
                                 600,
                                 worker_env,
+                                1,  # max_retries
+                                no_gif,
                             )
                             futures[new_future] = next_job_id
                             pending_count += 1
@@ -676,6 +762,7 @@ def run_production(
                 physics_config=physics_config,
                 dry_run=dry_run,
                 worker_env=worker_env,
+                no_gif=no_gif,
             )
             process_result(result)
 
@@ -746,8 +833,14 @@ Examples:
   # Run benchmark test (5 clips)
   python manager_benchmark.py --test --seed 42 --output_dir ./output/benchmark
 
-  # Run full production (all 16000 clips)
+  # Run full production (all 16000 clips) - auto-resumes if interrupted
   python manager_benchmark.py --seed 42 --output_dir ./output/dataset_v1
+
+  # Resume an interrupted run (just re-run the same command)
+  python manager_benchmark.py --seed 42 --output_dir ./output/dataset_v1
+
+  # Force restart from scratch (ignore existing completed clips)
+  python manager_benchmark.py --seed 42 --output_dir ./output/dataset_v1 --force_restart
 
   # Run specific range of jobs
   python manager_benchmark.py --seed 42 --output_dir ./output/batch1 \\
@@ -820,6 +913,18 @@ Examples:
         "--auto_scale",
         action="store_true",
         help="Enable VRAM-aware auto-scaling (pause submission when GPU memory is high)"
+    )
+
+    parser.add_argument(
+        "--force_restart",
+        action="store_true",
+        help="Ignore existing completed jobs and regenerate all (disables resume)"
+    )
+
+    parser.add_argument(
+        "--no_gif",
+        action="store_true",
+        help="Skip GIF preview generation (recommended for production runs)"
     )
 
     args = parser.parse_args()
@@ -923,6 +1028,8 @@ Examples:
             dry_run=args.dry_run,
             max_workers=args.workers,
             auto_scale=args.auto_scale,
+            force_restart=args.force_restart,
+            no_gif=args.no_gif,
         )
 
 

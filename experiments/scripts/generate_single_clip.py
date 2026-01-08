@@ -769,10 +769,18 @@ def render_scene(
     scene: "kb.Scene",
     renderer: "KubricRenderer",
     directories: dict,
-    config: dict
+    config: dict,
+    skip_gif: bool = False,
 ) -> dict:
     """
     Render the scene with RGB only (flow and segmentation disabled).
+
+    Args:
+        scene: Kubric scene to render
+        renderer: Kubric Blender renderer
+        directories: Output directory structure
+        config: Physics configuration
+        skip_gif: If True, skip GIF preview generation (faster for production)
 
     Returns:
         Dictionary with paths to rendered outputs
@@ -810,32 +818,37 @@ def render_scene(
     seg_paths = []
 
     # Create a quick GIF preview for visual appeal (not for analysis)
-    video_config = config["video"]
-    gif_path = directories["root"] / "preview.gif"
+    # Skip in production mode to save time
+    gif_path = None
+    if not skip_gif:
+        video_config = config["video"]
+        gif_path = directories["root"] / "preview.gif"
 
-    try:
-        from PIL import Image as PILImage
+        try:
+            from PIL import Image as PILImage
 
-        # Load RGB frames as PIL Images
-        pil_frames = []
-        for rgb_path in rgb_paths:
-            pil_frames.append(PILImage.open(rgb_path).convert("RGB"))
+            # Load RGB frames as PIL Images
+            pil_frames = []
+            for rgb_path in rgb_paths:
+                pil_frames.append(PILImage.open(rgb_path).convert("RGB"))
 
-        # Calculate frame duration in milliseconds
-        frame_duration_ms = int(1000 / video_config['fps'])
+            # Calculate frame duration in milliseconds
+            frame_duration_ms = int(1000 / video_config['fps'])
 
-        # Save as GIF (first frame with append of rest)
-        pil_frames[0].save(
-            gif_path,
-            save_all=True,
-            append_images=pil_frames[1:],
-            duration=frame_duration_ms,
-            loop=0  # Loop forever
-        )
-        logger.info(f"Created GIF preview: {gif_path}")
-    except Exception as e:
-        logger.warning(f"Could not create GIF preview: {e}")
-        gif_path = None
+            # Save as GIF (first frame with append of rest)
+            pil_frames[0].save(
+                gif_path,
+                save_all=True,
+                append_images=pil_frames[1:],
+                duration=frame_duration_ms,
+                loop=0  # Loop forever
+            )
+            logger.info(f"Created GIF preview: {gif_path}")
+        except Exception as e:
+            logger.warning(f"Could not create GIF preview: {e}")
+            gif_path = None
+    else:
+        logger.debug("Skipping GIF preview generation (--no_gif)")
 
     logger.info(f"Rendered {len(rgb_paths)} frames")
 
@@ -962,7 +975,8 @@ def generate_clip(
     output_dir: Path,
     job_id: int,
     seed: int,
-    config: dict
+    config: dict,
+    skip_gif: bool = False,
 ) -> dict:
     """
     Main function to generate a single clip.
@@ -972,6 +986,7 @@ def generate_clip(
         job_id: Unique identifier for this clip
         seed: Global seed value
         config: Physics configuration dict
+        skip_gif: If True, skip GIF preview generation
 
     Returns:
         Dictionary with generation results
@@ -1026,7 +1041,7 @@ def generate_clip(
     # Note: simulation is now complete with all keyframes properly transferred to Blender
 
     # Render all outputs
-    render_outputs = render_scene(scene, renderer, directories, config)
+    render_outputs = render_scene(scene, renderer, directories, config, skip_gif=skip_gif)
 
     # Save ground truth
     save_ground_truth(
@@ -1097,6 +1112,12 @@ def main():
         help="If set, only generate metadata without rendering"
     )
 
+    parser.add_argument(
+        "--no_gif",
+        action="store_true",
+        help="Skip GIF preview generation (faster for production runs)"
+    )
+
     args = parser.parse_args()
 
     # Validate inputs
@@ -1129,7 +1150,8 @@ def main():
                 output_dir,
                 args.job_id,
                 args.seed,
-                config
+                config,
+                skip_gif=args.no_gif,
             )
 
         # Print result as JSON for the orchestrator to parse
