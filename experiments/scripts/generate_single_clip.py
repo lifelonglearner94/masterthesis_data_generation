@@ -15,9 +15,36 @@ Usage:
 Author: Generated for Scientific Data Pipeline
 """
 
+# ============================================================================
+# CRITICAL: Thread limiting MUST happen BEFORE importing NumPy/BLAS libraries
+# This prevents CPU contention when running multiple workers in parallel.
+# ============================================================================
+import os
+
+def _apply_thread_limits():
+    """
+    Apply thread limits from environment variables.
+
+    The manager script injects OMP_NUM_THREADS=1, etc. to prevent
+    each worker from spawning multiple threads. This function ensures
+    these limits are respected even if set after process start.
+    """
+    # Check if running in parallel mode (manager sets these)
+    if os.environ.get("OMP_NUM_THREADS"):
+        # Already set by manager, just log it
+        pass
+    else:
+        # Default to conservative threading if not managed
+        # This helps when running standalone too
+        os.environ.setdefault("OMP_NUM_THREADS", "2")
+        os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+        os.environ.setdefault("MKL_NUM_THREADS", "2")
+        os.environ.setdefault("NUMEXPR_NUM_THREADS", "2")
+
+_apply_thread_limits()
+
 import subprocess
 import sys
-import shutil
 
 # Auto-install missing dependencies
 def _ensure_dependencies():
@@ -33,34 +60,16 @@ def _ensure_dependencies():
                 stdout=subprocess.DEVNULL
             )
 
-def _ensure_ffmpeg():
-    """Install ffmpeg if not available (required for MP4 video creation)."""
-    if shutil.which("ffmpeg") is None:
-        print("Installing ffmpeg for video creation...")
-        try:
-            subprocess.check_call(
-                ["apt-get", "update"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-            subprocess.check_call(
-                ["apt-get", "install", "-y", "ffmpeg"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-            print("ffmpeg installed successfully.")
-        except Exception as e:
-            print(f"WARNING: Could not install ffmpeg: {e}")
-            print("Video creation will be skipped.")
+
 
 _ensure_dependencies()
-_ensure_ffmpeg()
 
 import argparse
 import json
 import logging
 import os
 import random
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -83,6 +92,57 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# Exit codes matching manager_benchmark.py expectations
+EXIT_SUCCESS = 0
+EXIT_GENERAL_ERROR = 1
+EXIT_VRAM_ERROR = 2  # GPU memory exhaustion - retriable after cooldown
+
+# Error patterns that indicate VRAM exhaustion
+VRAM_ERROR_PATTERNS = [
+    "out of memory",
+    "CUDA out of memory",
+    "CUDA_ERROR_OUT_OF_MEMORY",
+    "cudaErrorMemoryAllocation",
+    "GPU memory",
+    "VRAM",
+    "cuMemAlloc",
+]
+
+
+def is_vram_error(error_message: str) -> bool:
+    """Check if an error message indicates GPU memory exhaustion."""
+    error_lower = error_message.lower()
+    return any(pattern.lower() in error_lower for pattern in VRAM_ERROR_PATTERNS)
+
+
+def get_blender_threads() -> int:
+    """
+    Get the number of threads Blender should use for CPU operations.
+
+    Respects the BLENDER_CPU_THREADS environment variable set by the manager.
+    Falls back to 0 (auto) if not set.
+
+    Returns:
+        Number of threads, or 0 for auto-detection
+    """
+    try:
+        return int(os.environ.get("BLENDER_CPU_THREADS", "0"))
+    except ValueError:
+        return 0
+
+
+def log_thread_configuration() -> None:
+    """Log the current thread configuration for debugging."""
+    thread_vars = [
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "BLENDER_CPU_THREADS",
+    ]
+    config_str = ", ".join(f"{v}={os.environ.get(v, 'unset')}" for v in thread_vars)
+    logger.debug(f"Thread configuration: {config_str}")
 
 
 def check_gpu_available() -> bool:
@@ -694,8 +754,9 @@ def setup_output_directories(output_dir: Path) -> dict:
     directories = {
         "root": output_dir,
         "rgb": output_dir / "rgb",
-        "flow": output_dir / "flow",
-        "segmentation": output_dir / "segmentation",
+        # NOTE: flow and segmentation disabled - only metadata needed
+        # "flow": output_dir / "flow",
+        # "segmentation": output_dir / "segmentation",
     }
 
     for dir_path in directories.values():
@@ -711,15 +772,16 @@ def render_scene(
     config: dict
 ) -> dict:
     """
-    Render the scene with RGB, optical flow, and segmentation.
+    Render the scene with RGB only (flow and segmentation disabled).
 
     Returns:
         Dictionary with paths to rendered outputs
     """
     # Render all frames (None means render all frames defined in scene)
+    # NOTE: flow and segmentation disabled - only metadata needed
     frames = renderer.render(
         frames=None,  # Render all frames in the scene
-        return_layers=["rgba", "forward_flow", "segmentation"]
+        return_layers=["rgba"]  # Removed "forward_flow", "segmentation"
     )
 
     # Save RGB frames
@@ -729,64 +791,59 @@ def render_scene(
         kb.write_png(frame[..., :3], frame_path)  # RGB only, no alpha
         rgb_paths.append(str(frame_path))
 
-    # Save optical flow as numpy arrays (preserves float precision and 2-channel data)
-    # Flow has shape (H, W, 2) for x and y components
+    # NOTE: Flow and segmentation saving disabled - only metadata needed
+    # # Save optical flow as numpy arrays (preserves float precision and 2-channel data)
+    # # Flow has shape (H, W, 2) for x and y components
+    # flow_paths = []
+    # for i, flow in enumerate(frames["forward_flow"]):
+    #     flow_path = directories["flow"] / f"flow_{i:05d}.npy"
+    #     np.save(flow_path, flow)
+    #     flow_paths.append(str(flow_path))
+    #
+    # # Save segmentation masks
+    # seg_paths = []
+    # for i, seg in enumerate(frames["segmentation"]):
+    #     seg_path = directories["segmentation"] / f"seg_{i:05d}.png"
+    #     kb.write_png(seg, seg_path)
+    #     seg_paths.append(str(seg_path))
     flow_paths = []
-    for i, flow in enumerate(frames["forward_flow"]):
-        flow_path = directories["flow"] / f"flow_{i:05d}.npy"
-        np.save(flow_path, flow)
-        flow_paths.append(str(flow_path))
-
-    # Save segmentation masks
     seg_paths = []
-    for i, seg in enumerate(frames["segmentation"]):
-        seg_path = directories["segmentation"] / f"seg_{i:05d}.png"
-        kb.write_png(seg, seg_path)
-        seg_paths.append(str(seg_path))
 
-    # Create video using ffmpeg (kb.write_video doesn't exist)
+    # Create a quick GIF preview for visual appeal (not for analysis)
     video_config = config["video"]
-    video_path = directories["root"] / "video.mp4"
+    gif_path = directories["root"] / "preview.gif"
 
     try:
-        import subprocess
-        import tempfile
+        from PIL import Image as PILImage
 
-        # Create a temporary file list for ffmpeg
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-            for rgb_path in rgb_paths:
-                f.write(f"file '{rgb_path}'\n")
-                f.write(f"duration {1.0 / video_config['fps']}\n")
-            file_list = f.name
+        # Load RGB frames as PIL Images
+        pil_frames = []
+        for rgb_path in rgb_paths:
+            pil_frames.append(PILImage.open(rgb_path).convert("RGB"))
 
-        # Use ffmpeg to create video with All-Intra encoding (no inter-frame compression)
-        # This provides maximum quality and frame-accurate seeking
-        ffmpeg_cmd = [
-            'ffmpeg', '-y',
-            '-f', 'concat', '-safe', '0',
-            '-i', file_list,
-            '-c:v', 'libx264',
-            '-preset', 'slow',           # Better compression efficiency
-            '-crf', '0',                  # Lossless quality
-            '-g', '1',                    # GOP size = 1 (All-Intra: every frame is a keyframe)
-            '-pix_fmt', 'yuv444p',        # Full chroma resolution (no subsampling)
-            '-r', str(video_config['fps']),
-            str(video_path)
-        ]
-        subprocess.run(ffmpeg_cmd, capture_output=True, check=True)
-        os.unlink(file_list)
-        logger.info(f"Created video: {video_path}")
+        # Calculate frame duration in milliseconds
+        frame_duration_ms = int(1000 / video_config['fps'])
+
+        # Save as GIF (first frame with append of rest)
+        pil_frames[0].save(
+            gif_path,
+            save_all=True,
+            append_images=pil_frames[1:],
+            duration=frame_duration_ms,
+            loop=0  # Loop forever
+        )
+        logger.info(f"Created GIF preview: {gif_path}")
     except Exception as e:
-        logger.warning(f"Could not create video: {e}")
-        video_path = None
+        logger.warning(f"Could not create GIF preview: {e}")
+        gif_path = None
 
     logger.info(f"Rendered {len(rgb_paths)} frames")
 
     return {
         "rgb_frames": rgb_paths,
-        "flow_frames": flow_paths,
-        "segmentation_frames": seg_paths,
-        "video": str(video_path) if video_path else None,
+        "flow_frames": flow_paths,  # Empty - disabled
+        "segmentation_frames": seg_paths,  # Empty - disabled
+        "gif_preview": str(gif_path) if gif_path else None,
     }
 
 
@@ -977,6 +1034,15 @@ def generate_clip(
         parameters, camera_info, config
     )
 
+    # Clean up scratch directory to save space
+    scratch_dir = output_dir / ".scratch"
+    if scratch_dir.exists():
+        try:
+            shutil.rmtree(scratch_dir)
+            logger.info(f"Cleaned up scratch directory: {scratch_dir}")
+        except Exception as e:
+            logger.warning(f"Failed to clean up scratch directory: {e}")
+
     logger.info(f"Successfully generated clip {job_id}")
 
     return {
@@ -1068,18 +1134,28 @@ def main():
 
         # Print result as JSON for the orchestrator to parse
         print(json.dumps(result, indent=2))
-        sys.exit(0)
+        sys.exit(EXIT_SUCCESS)
 
     except Exception as e:
+        error_str = str(e)
         logger.exception(f"Failed to generate clip {args.job_id}")
+
+        # Determine exit code based on error type
+        if is_vram_error(error_str):
+            exit_code = EXIT_VRAM_ERROR
+            logger.error("VRAM error detected - job may be retried")
+        else:
+            exit_code = EXIT_GENERAL_ERROR
+
         error_result = {
             "status": "error",
             "job_id": args.job_id,
-            "error": str(e),
+            "error": error_str,
             "output_dir": str(output_dir),
+            "exit_code": exit_code,
         }
         print(json.dumps(error_result, indent=2))
-        sys.exit(1)
+        sys.exit(exit_code)
 
 
 if __name__ == "__main__":

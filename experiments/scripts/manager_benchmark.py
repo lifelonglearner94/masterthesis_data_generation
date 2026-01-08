@@ -41,12 +41,13 @@ import json
 import logging
 import os
 import random
+import threading
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import yaml
 
@@ -60,6 +61,84 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Exit codes for worker script
+EXIT_SUCCESS = 0
+EXIT_GENERAL_ERROR = 1
+EXIT_VRAM_ERROR = 2  # GPU memory exhaustion - retriable after cooldown
+
+# VRAM monitoring thresholds
+VRAM_HIGH_THRESHOLD = 0.85  # Pause submission above 85% usage
+VRAM_LOW_THRESHOLD = 0.70   # Resume submission below 70% usage
+VRAM_CHECK_INTERVAL = 5.0   # Seconds between VRAM checks
+VRAM_RETRY_DELAY = 30.0     # Seconds to wait before retrying VRAM failure
+
+
+def get_default_workers() -> int:
+    """Calculate default worker count based on CPU cores."""
+    cpu_count = os.cpu_count() or 4
+    return max(1, cpu_count - 2)
+
+
+def get_gpu_vram_usage() -> Tuple[float, float, float]:
+    """
+    Query GPU VRAM usage via nvidia-smi.
+
+    Returns:
+        Tuple of (used_mb, total_mb, usage_fraction) or (0, 0, 0) if unavailable
+    """
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            # Parse "1234, 8192" format
+            parts = result.stdout.strip().split(", ")
+            if len(parts) >= 2:
+                used = float(parts[0])
+                total = float(parts[1])
+                fraction = used / total if total > 0 else 0
+                return used, total, fraction
+    except Exception as e:
+        logger.debug(f"VRAM query failed: {e}")
+    return 0.0, 0.0, 0.0
+
+
+def wait_for_vram_available(threshold: float = VRAM_HIGH_THRESHOLD) -> None:
+    """Block until VRAM usage drops below threshold."""
+    used, total, fraction = get_gpu_vram_usage()
+    if fraction > threshold:
+        logger.info(f"VRAM usage high ({fraction*100:.1f}%), waiting for availability...")
+        while fraction > VRAM_LOW_THRESHOLD:
+            time.sleep(VRAM_CHECK_INTERVAL)
+            used, total, fraction = get_gpu_vram_usage()
+        logger.info(f"VRAM available ({fraction*100:.1f}%), resuming...")
+
+
+def build_worker_environment() -> dict:
+    """
+    Build environment dict for worker subprocesses with thread limiting.
+
+    Forces NumPy/OpenBLAS/MKL to use single-threaded mode to prevent
+    resource contention when running multiple workers.
+    """
+    env = os.environ.copy()
+
+    # Force single-threaded NumPy/BLAS operations
+    env["OMP_NUM_THREADS"] = "1"
+    env["OPENBLAS_NUM_THREADS"] = "1"
+    env["MKL_NUM_THREADS"] = "1"
+    env["MKL_THREADING_LAYER"] = "GNU"
+    env["NUMEXPR_NUM_THREADS"] = "1"
+    env["VECLIB_MAXIMUM_THREADS"] = "1"
+
+    # Limit Blender's internal threading
+    env["BLENDER_CPU_THREADS"] = "1"
+
+    return env
+
 
 @dataclass
 class JobResult:
@@ -69,6 +148,7 @@ class JobResult:
     elapsed_time: float
     output_dir: str
     error_message: Optional[str] = None
+    return_code: int = 0  # 0=success, 1=general error, 2=VRAM error (retriable)
 
 
 @dataclass
@@ -127,7 +207,8 @@ def run_single_job(
     seed: int,
     physics_config: Path,
     dry_run: bool = False,
-    timeout: int = 600  # 10 minute timeout per job
+    timeout: int = 600,  # 10 minute timeout per job
+    worker_env: Optional[dict] = None,
 ) -> JobResult:
     """
     Execute a single worker script as a subprocess.
@@ -140,6 +221,7 @@ def run_single_job(
         physics_config: Path to physics config YAML
         dry_run: If True, run in dry-run mode
         timeout: Maximum time to wait for job completion
+        worker_env: Environment dict for subprocess (with thread limits)
 
     Returns:
         JobResult with execution details
@@ -160,6 +242,9 @@ def run_single_job(
     if dry_run:
         cmd.append("--dry_run")
 
+    # Use thread-limited environment if provided
+    env = worker_env if worker_env is not None else build_worker_environment()
+
     start_time = time.perf_counter()
 
     try:
@@ -167,17 +252,19 @@ def run_single_job(
             cmd,
             capture_output=True,
             text=True,
-            timeout=timeout
+            timeout=timeout,
+            env=env,
         )
 
         elapsed = time.perf_counter() - start_time
 
-        if result.returncode == 0:
+        if result.returncode == EXIT_SUCCESS:
             return JobResult(
                 job_id=job_id,
                 success=True,
                 elapsed_time=elapsed,
                 output_dir=str(job_output_dir),
+                return_code=EXIT_SUCCESS,
             )
         else:
             return JobResult(
@@ -186,6 +273,7 @@ def run_single_job(
                 elapsed_time=elapsed,
                 output_dir=str(job_output_dir),
                 error_message=result.stderr or result.stdout,
+                return_code=result.returncode,
             )
 
     except subprocess.TimeoutExpired:
@@ -196,6 +284,7 @@ def run_single_job(
             elapsed_time=elapsed,
             output_dir=str(job_output_dir),
             error_message=f"Job timed out after {timeout} seconds",
+            return_code=EXIT_GENERAL_ERROR,
         )
     except Exception as e:
         elapsed = time.perf_counter() - start_time
@@ -205,7 +294,45 @@ def run_single_job(
             elapsed_time=elapsed,
             output_dir=str(job_output_dir),
             error_message=str(e),
+            return_code=EXIT_GENERAL_ERROR,
         )
+
+
+def run_single_job_with_retry(
+    worker_script: Path,
+    output_dir: Path,
+    job_id: int,
+    seed: int,
+    physics_config: Path,
+    dry_run: bool = False,
+    timeout: int = 600,
+    worker_env: Optional[dict] = None,
+    max_retries: int = 1,
+) -> JobResult:
+    """
+    Execute a job with retry logic for VRAM errors.
+
+    VRAM errors (exit code 2) are retried once after a cooldown period.
+    Other errors fail immediately.
+    """
+    result = run_single_job(
+        worker_script, output_dir, job_id, seed, physics_config,
+        dry_run, timeout, worker_env
+    )
+
+    if result.success:
+        return result
+
+    # Retry only for VRAM errors
+    if result.return_code == EXIT_VRAM_ERROR and max_retries > 0:
+        logger.warning(f"Job {job_id} failed with VRAM error, retrying in {VRAM_RETRY_DELAY}s...")
+        time.sleep(VRAM_RETRY_DELAY)
+        return run_single_job_with_retry(
+            worker_script, output_dir, job_id, seed, physics_config,
+            dry_run, timeout, worker_env, max_retries - 1
+        )
+
+    return result
 
 
 def run_benchmark(
@@ -381,10 +508,15 @@ def run_production(
     start_job: int = 0,
     end_job: int = 16999,
     dry_run: bool = False,
-    max_workers: int = 1,  # Sequential by default for GPU
+    max_workers: int = 1,
+    auto_scale: bool = False,
 ) -> None:
     """
-    Run the full production dataset generation.
+    Run the full production dataset generation with pipeline saturation.
+
+    Uses a bounded process pool pattern to keep workers saturated while
+    preventing resource exhaustion. Each worker runs with thread-limited
+    environment to avoid CPU contention.
 
     Args:
         worker_script: Path to worker script
@@ -395,105 +527,170 @@ def run_production(
         end_job: Ending job ID (inclusive)
         dry_run: If True, run in dry-run mode
         max_workers: Number of parallel workers
+        auto_scale: If True, pause submission when VRAM is high
     """
     total_jobs = end_job - start_job + 1
     logger.info(f"Starting production run: jobs {start_job} to {end_job} ({total_jobs:,} total)")
+    logger.info(f"Parallel workers: {max_workers} (auto_scale={auto_scale})")
 
     # Create error log file
     error_log_path = output_dir / "error_log.txt"
 
-    # Track progress
-    completed = 0
-    failed = 0
+    # Track progress with thread-safe counter
+    progress_lock = threading.Lock()
+    completed = [0]  # Mutable container for closure
+    failed = [0]
     start_time = time.perf_counter()
 
     # Create global metadata
     save_global_metadata(output_dir, seed, physics_config, start_job, end_job)
 
+    # Build thread-limited environment once
+    worker_env = build_worker_environment()
+
     # Process jobs
-    job_ids = range(start_job, end_job + 1)
+    job_ids = list(range(start_job, end_job + 1))
+
+    def process_result(result: JobResult) -> None:
+        """Thread-safe result processing."""
+        with progress_lock:
+            completed[0] += 1
+            current = completed[0]
+
+            if result.success:
+                if current % 100 == 0 or current == 1:
+                    elapsed = time.perf_counter() - start_time
+                    rate = current / elapsed if elapsed > 0 else 0
+                    remaining = (total_jobs - current) / rate / 3600 if rate > 0 else 0
+                    logger.info(
+                        f"Progress: {current}/{total_jobs} "
+                        f"({100*current/total_jobs:.1f}%) - "
+                        f"Rate: {rate:.2f} clips/s - "
+                        f"Est. remaining: {remaining:.1f}h"
+                    )
+            else:
+                failed[0] += 1
+                log_error(error_log_path, result)
+                logger.warning(
+                    f"Job {result.job_id} failed (exit={result.return_code}): "
+                    f"{result.error_message[:100] if result.error_message else 'Unknown'}"
+                )
 
     if max_workers > 1:
-        # Parallel execution (useful for CPU-only or multiple GPUs)
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        # Parallel execution with bounded submission
+        # Use ThreadPoolExecutor to manage subprocess workers
+        # This allows VRAM monitoring between submissions
+        logger.info(f"Using parallel execution with {max_workers} workers")
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {}
-            for job_id in job_ids:
-                future = executor.submit(
-                    run_single_job,
-                    worker_script,
-                    output_dir,
-                    job_id,
-                    seed,
-                    physics_config,
-                    dry_run,
-                )
-                futures[future] = job_id
+            pending_count = 0
+            job_iter = iter(job_ids)
+            jobs_remaining = True
 
-            for future in as_completed(futures):
-                job_id = futures[future]
+            # Submit initial batch up to max_workers
+            for _ in range(max_workers):
                 try:
-                    result = future.result()
-                    completed += 1
+                    job_id = next(job_iter)
 
-                    if result.success:
-                        if completed % 100 == 0:
-                            elapsed = time.perf_counter() - start_time
-                            rate = completed / elapsed
-                            remaining = (total_jobs - completed) / rate / 3600
-                            logger.info(
-                                f"Progress: {completed}/{total_jobs} "
-                                f"({100*completed/total_jobs:.1f}%) - "
-                                f"Est. remaining: {remaining:.1f}h"
+                    # VRAM-aware submission throttling
+                    if auto_scale:
+                        wait_for_vram_available()
+
+                    future = executor.submit(
+                        run_single_job_with_retry,
+                        worker_script,
+                        output_dir,
+                        job_id,
+                        seed,
+                        physics_config,
+                        dry_run,
+                        600,  # timeout
+                        worker_env,
+                    )
+                    futures[future] = job_id
+                    pending_count += 1
+                except StopIteration:
+                    jobs_remaining = False
+                    break
+
+            # Process completions and submit new jobs (bounded queue pattern)
+            while futures:
+                # Wait for at least one future to complete
+                done_futures = []
+                for future in list(futures.keys()):
+                    if future.done():
+                        done_futures.append(future)
+
+                if not done_futures:
+                    # No futures done yet, wait a bit
+                    time.sleep(0.1)
+                    continue
+
+                # Process completed futures
+                for future in done_futures:
+                    job_id = futures.pop(future)
+                    pending_count -= 1
+
+                    try:
+                        result = future.result()
+                        process_result(result)
+                    except Exception as e:
+                        with progress_lock:
+                            failed[0] += 1
+                        logger.error(f"Job {job_id} raised exception: {e}")
+
+                    # Submit a new job if any remaining
+                    if jobs_remaining:
+                        try:
+                            next_job_id = next(job_iter)
+
+                            # VRAM-aware throttling
+                            if auto_scale:
+                                wait_for_vram_available()
+
+                            new_future = executor.submit(
+                                run_single_job_with_retry,
+                                worker_script,
+                                output_dir,
+                                next_job_id,
+                                seed,
+                                physics_config,
+                                dry_run,
+                                600,
+                                worker_env,
                             )
-                    else:
-                        failed += 1
-                        log_error(error_log_path, result)
-
-                except Exception as e:
-                    failed += 1
-                    logger.error(f"Job {job_id} raised exception: {e}")
+                            futures[new_future] = next_job_id
+                            pending_count += 1
+                        except StopIteration:
+                            jobs_remaining = False
     else:
         # Sequential execution (standard for single GPU)
+        logger.info("Using sequential execution (single worker)")
         for job_id in job_ids:
-            result = run_single_job(
+            result = run_single_job_with_retry(
                 worker_script=worker_script,
                 output_dir=output_dir,
                 job_id=job_id,
                 seed=seed,
                 physics_config=physics_config,
                 dry_run=dry_run,
+                worker_env=worker_env,
             )
-
-            completed += 1
-
-            if result.success:
-                if completed % 100 == 0 or completed == 1:
-                    elapsed = time.perf_counter() - start_time
-                    rate = completed / elapsed if elapsed > 0 else 0
-                    remaining = (total_jobs - completed) / rate / 3600 if rate > 0 else 0
-                    logger.info(
-                        f"Progress: {completed}/{total_jobs} "
-                        f"({100*completed/total_jobs:.1f}%) - "
-                        f"Rate: {rate:.2f} clips/s - "
-                        f"Est. remaining: {remaining:.1f}h"
-                    )
-            else:
-                failed += 1
-                log_error(error_log_path, result)
-                logger.warning(f"Job {job_id} failed: {result.error_message[:100] if result.error_message else 'Unknown'}")
+            process_result(result)
 
     # Final summary
     total_time = time.perf_counter() - start_time
     logger.info(f"\n{'='*60}")
     logger.info(f"PRODUCTION RUN COMPLETE")
     logger.info(f"{'='*60}")
-    logger.info(f"Total clips processed: {completed}")
-    logger.info(f"Successful: {completed - failed}")
-    logger.info(f"Failed: {failed}")
+    logger.info(f"Total clips processed: {completed[0]}")
+    logger.info(f"Successful: {completed[0] - failed[0]}")
+    logger.info(f"Failed: {failed[0]}")
     logger.info(f"Total time: {total_time/3600:.2f} hours")
-    logger.info(f"Average time per clip: {total_time/completed:.2f}s" if completed > 0 else "N/A")
+    logger.info(f"Average time per clip: {total_time/completed[0]:.2f}s" if completed[0] > 0 else "N/A")
 
-    if failed > 0:
+    if failed[0] > 0:
         logger.warning(f"Check {error_log_path} for failure details")
 
 
@@ -615,11 +812,21 @@ Examples:
     parser.add_argument(
         "--workers",
         type=int,
-        default=1,
-        help="Number of parallel workers (default: 1 for GPU)"
+        default=None,
+        help=f"Number of parallel workers (default: CPU_COUNT-2 = {get_default_workers()})"
+    )
+
+    parser.add_argument(
+        "--auto_scale",
+        action="store_true",
+        help="Enable VRAM-aware auto-scaling (pause submission when GPU memory is high)"
     )
 
     args = parser.parse_args()
+
+    # Set default workers if not specified
+    if args.workers is None:
+        args.workers = get_default_workers()
 
     # Resolve paths
     script_dir = Path(__file__).parent.resolve()
@@ -715,6 +922,7 @@ Examples:
             end_job=args.end_job,
             dry_run=args.dry_run,
             max_workers=args.workers,
+            auto_scale=args.auto_scale,
         )
 
 

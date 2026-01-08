@@ -9,6 +9,7 @@ This pipeline generates 256×256 video clips of a cube receiving force impulses 
 - **RGB video** (32 frames @ 20 FPS)
 - **Optical flow** (NumPy format)
 - **Segmentation masks**
+- **V-JEPA2 feature maps** (encoded ViT-L/16 embeddings)
 - **Ground truth metadata** (friction, force vectors, mass, etc.)
 
 ## 📁 Project Structure
@@ -16,47 +17,39 @@ This pipeline generates 256×256 video clips of a cube receiving force impulses 
 ```
 experiments/
 ├── config/
-│   └── physics_config.yaml    # Physics parameter ranges
+│   └── physics_config.yaml       # Physics parameter ranges
 ├── scripts/
 │   ├── generate_single_clip.py   # Worker: generates one clip
 │   ├── manager_benchmark.py      # Orchestrator: manages full dataset
-│   └── run_docker.sh             # Docker launcher with GPU
+│   └── encode_benchmark_vjepa2.py # V-JEPA2 feature extraction
 └── output/
     └── [generated datasets]
 ```
 
 ---
 
-## 🚀 Quick Start: Two Ways to Use the Pipeline
+## 🚀 Two-Phase Workflow
 
-### Prerequisites
-
-1. **Docker** with NVIDIA Container Toolkit (for GPU acceleration)
-2. **NVIDIA GPU** with CUDA support (optional, CPU works but is slower)
+The pipeline runs in two phases:
+1. **Phase 1 (Docker)**: Render clips using Kubric/Blender/PyBullet
+2. **Phase 2 (Local)**: Encode clips using V-JEPA2 on GPU
 
 ---
 
-## Option A: Benchmark Test (5 Clips + Time Estimation)
+## 📋 Option A: Test Scenario (5 Clips)
 
-**Purpose:** Quick validation that the pipeline works and estimation of full dataset generation time.
+Quick validation that everything works.
 
-### Step 1: Start Docker Container
+### Step 1: Render Clips (Docker)
 
 ```bash
-# From project root directory
+# From project root
 cd /path/to/masterthesis_data_generation
 
-# With GPU (recommended)
+# Start Docker container with GPU and increased shared memory for parallel workers
 docker run --rm -it \
     --gpus all \
-    -v "$(pwd)/experiments/scripts:/scripts" \
-    -v "$(pwd)/experiments/config:/config" \
-    -v "$(pwd)/experiments/output:/output" \
-    kubricdockerhub/kubruntu:latest \
-    /bin/bash
-
-# Without GPU (CPU-only, slower)
-docker run --rm -it \
+    --shm-size=8g \
     -v "$(pwd)/experiments/scripts:/scripts" \
     -v "$(pwd)/experiments/config:/config" \
     -v "$(pwd)/experiments/output:/output" \
@@ -64,65 +57,63 @@ docker run --rm -it \
     /bin/bash
 ```
 
-### Step 2: Run Benchmark Test (Inside Container)
+**Inside Docker container:**
 
 ```bash
 cd /scripts && python manager_benchmark.py \
     --test \
+    --test_clips 5 \
     --seed 42 \
-    --output_dir /output/benchmark_test \
-    --test_clips 5
+    --output_dir /output/test_5clips
 ```
 
-### Expected Output
+Then exit Docker with `exit`.
 
+### Step 2: Fix Permissions (Local)
+
+```bash
+sudo chown -R $USER:$USER experiments/output/test_5clips
 ```
-============================================================
-           BENCHMARK REPORT
-============================================================
 
-Test Configuration:
-  • Jobs tested:      5
-  • Successful:       5
-  • Failed:           0
+### Step 3: Encode with V-JEPA2 (Local)
 
-Timing Statistics (successful jobs):
-  • Average per clip: 45.23 seconds
-  • Min time:         42.10 seconds
-  • Max time:         48.50 seconds
+```bash
+uv run experiments/scripts/encode_benchmark_vjepa2.py \
+    --data_dir experiments/output/test_5clips \
+    --in_place \
+    --batch_size 4
+```
 
-────────────────────────────────────────────────────────────
-  📊 PRODUCTION ESTIMATE for 16,000 clips:
+### Verify Results
 
-     Average time per clip: 45.23 seconds
-     Estimated total time:  201.0 hours
-                           (8.4 days)
-────────────────────────────────────────────────────────────
+```bash
+# Check that feature maps were created
+ls experiments/output/test_5clips/clip_*/feature_maps/
+
+# Inspect a feature map
+python -c "import numpy as np; a = np.load('experiments/output/test_5clips/clip_00654/feature_maps/vjepa2_vitl16.npy'); print(f'Shape: {a.shape}, Dtype: {a.dtype}')"
 ```
 
 ---
 
-## Option B: Full Production Run (16,000 Clips)
+## �� Option B: Full Production (17,000 Clips)
 
-**Purpose:** Generate the complete dataset for training.
+Generate the complete A-B-A dataset:
+- **Phase A₁** (clips 0–14,999): Normal friction, random mass
+- **Phase B** (clips 15,000–15,999): Slippery friction, fixed mass (OOD)
+- **Phase A₂** (clips 16,000–16,999): Normal friction, fixed mass
 
-### Step 1: Start Docker Container
+### Step 1: Render All Clips (Docker)
 
 ```bash
-# From project root directory
+# From project root
 cd /path/to/masterthesis_data_generation
 
-# With GPU (recommended)
+# Start Docker container with GPU and increased shared memory for parallel workers
+# NOTE: --shm-size=8g is REQUIRED for parallel execution
 docker run --rm -it \
     --gpus all \
-    -v "$(pwd)/experiments/scripts:/scripts" \
-    -v "$(pwd)/experiments/config:/config" \
-    -v "$(pwd)/experiments/output:/output" \
-    kubricdockerhub/kubruntu:latest \
-    /bin/bash
-
-# Without GPU (CPU-only, slower)
-docker run --rm -it \
+    --shm-size=8g \
     -v "$(pwd)/experiments/scripts:/scripts" \
     -v "$(pwd)/experiments/config:/config" \
     -v "$(pwd)/experiments/output:/output" \
@@ -130,58 +121,65 @@ docker run --rm -it \
     /bin/bash
 ```
 
-### Step 2: Run Full Generation (Inside Container)
+**Inside Docker container (parallel execution recommended):**
 
 ```bash
+# Use parallel workers for faster generation (saturates CPU/GPU pipeline)
 cd /scripts && python manager_benchmark.py \
     --seed 42 \
-    --output_dir /output/friction_dataset_v1
-```
-
-### Generate Specific Range (Optional)
-
-For batch processing or resuming interrupted runs:
-
-```bash
-# Generate clips 0-4999 only
-cd /scripts && python manager_benchmark.py \
-    --seed 42 \
-    --output_dir /output/batch_1 \
+    --output_dir /output/friction_dataset_v1 \
     --start_job 0 \
-    --end_job 4999
+    --end_job 16999 \
+    --workers 4 \
+    --auto_scale
 ```
 
----
+> 💡 **Parallel Execution**: Using `--workers 4` with `--auto_scale` keeps the GPU busy while CPUs prepare the next frames. This can reduce total time by 50-70%.
 
-## 🧹 Cleanup Output Folder
+> ⏱️ **Estimated time**: ~3-4 days with 4 parallel workers (vs ~8-10 days sequential)
 
-Files generated inside Docker are owned by root. Use sudo to clean up:
+Then exit Docker with `exit`.
+
+### Step 2: Fix Permissions (Local)
 
 ```bash
-sudo rm -rf experiments/output/*
+sudo chown -R $USER:$USER experiments/output/friction_dataset_v1
 ```
+
+### Step 3: Encode with V-JEPA2 (Local)
+
+```bash
+uv run experiments/scripts/encode_benchmark_vjepa2.py \
+    --data_dir experiments/output/friction_dataset_v1 \
+    --in_place \
+    --batch_size 4
+```
+
+> ⏱️ **Estimated time**: ~2-4 hours on a single GPU
 
 ---
 
 ## 📊 Output Structure
 
-Each generated clip follows this structure:
+Each generated clip has this structure:
 
 ```
 output/dataset_name/
-├── benchmark_report.json   # Timing and success statistics
-├── generation.log          # Full generation log
+├── benchmark_report.json       # Timing and success statistics
+├── generation.log              # Full generation log
 ├── clip_00000/
 │   ├── rgb/
 │   │   ├── frame_00000.png
-│   │   └── ...
+│   │   └── ... (32 frames)
 │   ├── flow/
 │   │   ├── flow_00000.npy
 │   │   └── ...
 │   ├── segmentation/
 │   │   ├── seg_00000.png
 │   │   └── ...
-│   ├── video.mp4           # All-Intra encoded (lossless)
+│   ├── feature_maps/
+│   │   └── vjepa2_vitl16.npy   # (4096, 1024) float16
+│   ├── preview.gif             # Quick visual preview
 │   └── ground_truth.json
 ├── clip_00001/
 └── ...
@@ -191,45 +189,123 @@ output/dataset_name/
 
 ## 🔧 Configuration
 
-Edit `config/physics_config.yaml` to customize physics parameters:
+Edit `experiments/config/physics_config.yaml` to customize physics parameters:
 
-| Parameter | Normal Range | Slippery (OOD) Range |
-|-----------|--------------|----------------------|
-| Friction coefficient | 0.5 – 0.9 | 0.01 – 0.15 |
-| Force magnitude | 5 – 25 N | 5 – 25 N |
-| Object mass | 0.5 – 2.0 kg | 0.5 – 2.0 kg |
+| Phase | Friction | Mass Mode | Clip Range |
+|-------|----------|-----------|------------|
+| A₁ | Normal (0.5–0.9) | Random | 0–14,999 |
+| B | Slippery (0.01–0.15) | Fixed | 15,000–15,999 |
+| A₂ | Normal (0.5–0.9) | Fixed | 16,000–16,999 |
 
 ---
 
 ## 📋 CLI Reference
 
-### manager_benchmark.py
+### manager_benchmark.py (Rendering)
 
 | Flag | Description |
 |------|-------------|
 | `--output_dir` | Base directory for all clips |
 | `--seed` | Global seed for reproducibility |
-| `--test` | Run benchmark mode (default 5 clips) |
-| `--test_clips N` | Number of clips in test mode |
-| `--start_job N` | Starting job ID for production |
-| `--end_job N` | Ending job ID for production |
-| `--dry_run` | Metadata only (no rendering) |
+| `--test` | Run benchmark mode |
+| `--test_clips N` | Number of clips in test mode (default: 5) |
+| `--start_job N` | Starting job ID (default: 0) |
+| `--end_job N` | Ending job ID (default: 16999) |
+| `--dry_run` | Metadata only, no rendering |
+| `--workers N` | Parallel workers (default: CPU_COUNT-2). Use 1 for sequential |
+| `--auto_scale` | VRAM-aware throttling: pause submission when GPU memory is high |
+
+### encode_benchmark_vjepa2.py (Encoding)
+
+| Flag | Description |
+|------|-------------|
+| `--data_dir` | Path to dataset with clip_* folders |
+| `--in_place` | Save to clip_*/feature_maps/ (recommended) |
+| `--out_dir` | Alternative: central output directory |
+| `--batch_size` | Clips per batch (default: 4) |
+| `--dtype` | fp16 or fp32 (default: fp16) |
+| `--overwrite` | Overwrite existing embeddings |
+| `--crop_size` | V-JEPA2 crop size (default: 256) |
 
 ---
 
 ## ⚠️ Troubleshooting
 
-### GPU Not Detected
+### GPU Not Detected in Docker
 
 ```bash
 # Verify NVIDIA Container Toolkit
 docker run --rm --gpus all nvidia/cuda:11.0-base nvidia-smi
 ```
 
-### Files Owned by Root
+### Permission Denied Errors
 
-Docker creates files as root. Clean up with:
+Docker creates files as root. Fix with:
 ```bash
+sudo chown -R $USER:$USER experiments/output/
+```
+
+### Parallel Execution Crashes / Freezing
+
+If parallel workers cause crashes or system freezing:
+
+1. **Increase shared memory** (required for IPC):
+   ```bash
+   docker run --shm-size=8g ...  # Minimum 8GB recommended
+   ```
+
+2. **Reduce worker count** if CPU is overloaded:
+   ```bash
+   --workers 2  # Start conservative, increase gradually
+   ```
+
+3. **Enable VRAM monitoring** to prevent GPU OOM:
+   ```bash
+   --auto_scale  # Pauses new jobs when GPU memory > 85%
+   ```
+
+4. **Check for VRAM errors** in the error log:
+   ```bash
+   grep -i "memory\|vram\|cuda" /output/*/error_log.txt
+   ```
+
+### V-JEPA2 Dependencies Missing
+
+```bash
+# Install encoding dependencies (local machine)
+uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+uv pip install timm einops opencv-python
+```
+
+### Resume Interrupted Rendering
+
+Use `--start_job` and `--end_job` to generate specific ranges:
+```bash
+# Generate clips 5000-9999 only
+cd /scripts && python manager_benchmark.py \
+    --seed 42 \
+    --output_dir /output/friction_dataset_v1 \
+    --start_job 5000 \
+    --end_job 9999 \
+    --workers 4
+```
+
+### Re-encode Specific Clips
+
+The encoder skips existing feature maps. Use `--overwrite` to force re-encoding:
+```bash
+python experiments/scripts/encode_benchmark_vjepa2.py \
+    --data_dir experiments/output/friction_dataset_v1 \
+    --in_place \
+    --overwrite
+```
+
+---
+
+## 🧹 Cleanup
+
+```bash
+# Remove all outputs (requires sudo due to Docker ownership)
 sudo rm -rf experiments/output/*
 ```
 
@@ -238,4 +314,5 @@ sudo rm -rf experiments/output/*
 ## 📚 References
 
 - [Kubric GitHub](https://github.com/google-research/kubric)
+- [V-JEPA2 GitHub](https://github.com/facebookresearch/vjepa2)
 - [PyBullet](https://pybullet.org/)

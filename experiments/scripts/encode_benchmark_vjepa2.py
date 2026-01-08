@@ -161,6 +161,139 @@ def _save_embedding(out_path: Path, tensor, dtype: str) -> None:
     np.save(out_path, arr)
 
 
+# ============================================================================
+# Singleton encoder for reuse across multiple encode_single_clip calls
+# ============================================================================
+_ENCODER_CACHE = {
+    "model": None,
+    "preprocessor": None,
+    "device": None,
+    "torch": None,
+    "Image": None,
+}
+
+
+def get_encoder(crop_size: int = 256, allow_cpu: bool = True):
+    """
+    Load and cache the V-JEPA2 encoder model (singleton pattern).
+
+    Args:
+        crop_size: V-JEPA2 eval crop_size (default 256)
+        allow_cpu: If True, fall back to CPU when no GPU is available
+
+    Returns:
+        Tuple of (model, preprocessor, device, torch_module, Image_module)
+    """
+    if _ENCODER_CACHE["model"] is not None:
+        return (
+            _ENCODER_CACHE["model"],
+            _ENCODER_CACHE["preprocessor"],
+            _ENCODER_CACHE["device"],
+            _ENCODER_CACHE["torch"],
+            _ENCODER_CACHE["Image"],
+        )
+
+    torch, Image = _require_imports()
+
+    device_count = torch.cuda.device_count()
+    device = torch.device("cuda" if device_count > 0 else "cpu")
+    if device.type != "cuda":
+        if not allow_cpu:
+            raise RuntimeError(
+                "No CUDA devices detected. V-JEPA2 encoding requires GPU."
+            )
+        print("V-JEPA2 encoder: WARNING - Using CPU (will be slow)")
+
+    # Load preprocessor + model via torch.hub
+    preprocessor = torch.hub.load(
+        "facebookresearch/vjepa2", "vjepa2_preprocessor", crop_size=crop_size
+    )
+    encoder, _predictor = torch.hub.load(
+        "facebookresearch/vjepa2", "vjepa2_vit_large"
+    )
+    model = encoder
+    model.eval().to(device)
+
+    if device_count > 1:
+        model = torch.nn.DataParallel(model)
+        print(f"V-JEPA2 encoder: Using DataParallel across {device_count} GPUs")
+    elif device.type == "cuda":
+        print("V-JEPA2 encoder: Using single GPU")
+
+    # Cache for reuse
+    _ENCODER_CACHE["model"] = model
+    _ENCODER_CACHE["preprocessor"] = preprocessor
+    _ENCODER_CACHE["device"] = device
+    _ENCODER_CACHE["torch"] = torch
+    _ENCODER_CACHE["Image"] = Image
+
+    return model, preprocessor, device, torch, Image
+
+
+def encode_single_clip(
+    clip_dir: Path,
+    dtype: str = "fp16",
+    crop_size: int = 256,
+    overwrite: bool = False,
+) -> Path:
+    """
+    Encode a single clip's RGB frames and save feature maps to clip_dir/feature_maps/.
+
+    This function is designed to be called immediately after clip generation.
+    Uses a cached encoder model for efficiency across multiple calls.
+
+    Args:
+        clip_dir: Path to the clip directory (contains rgb/ folder with frame_*.png)
+        dtype: Numpy dtype for saving ('fp16' or 'fp32')
+        crop_size: V-JEPA2 eval crop_size (default 256)
+        overwrite: If True, overwrite existing feature map
+
+    Returns:
+        Path to the saved feature map .npy file
+
+    Raises:
+        FileNotFoundError: If clip_dir or rgb frames don't exist
+        RuntimeError: If no CUDA device is available
+    """
+    clip_dir = Path(clip_dir)
+    rgb_dir = clip_dir / "rgb"
+
+    if not rgb_dir.exists():
+        raise FileNotFoundError(f"RGB directory not found: {rgb_dir}")
+
+    frame_paths = sorted(rgb_dir.glob("frame_*.png"))
+    if not frame_paths:
+        raise FileNotFoundError(f"No frame_*.png files found in: {rgb_dir}")
+
+    # Output path: clip_dir/feature_maps/vjepa2_vitl16.npy
+    feature_maps_dir = clip_dir / "feature_maps"
+    out_path = feature_maps_dir / "vjepa2_vitl16.npy"
+
+    if out_path.exists() and not overwrite:
+        print(f"Skipping (exists): {out_path}")
+        return out_path
+
+    # Get or load the encoder
+    model, preprocessor, device, torch, Image = get_encoder(crop_size)
+
+    # Load and preprocess the clip
+    video_np = _load_clip_as_numpy(frame_paths, Image)
+    tensor = preprocessor(video_np)[0]  # C x T x H x W
+    x = tensor.unsqueeze(0).to(device, non_blocking=True)  # 1 x C x T x H x W
+
+    # Encode
+    with torch.inference_mode():
+        embedding = model(x)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    # Save (squeeze batch dim since we only have one clip)
+    _save_embedding(out_path, embedding[0], dtype=dtype)
+
+    print(f"Encoded and saved: {out_path}")
+    return out_path
+
+
 def _batched(items: List[ClipItem], batch_size: int) -> List[List[ClipItem]]:
     return [items[i : i + batch_size] for i in range(0, len(items), batch_size)]
 
@@ -179,7 +312,12 @@ def main() -> int:
         "--out_dir",
         type=Path,
         default=None,
-        help="Where to write embeddings (.npy). Default: <data_dir>/embeddings_vjepa2_vitl16",
+        help="Where to write embeddings (.npy). Default: <data_dir>/embeddings_vjepa2_vitl16. Ignored if --in_place is set.",
+    )
+    parser.add_argument(
+        "--in_place",
+        action="store_true",
+        help="Save feature maps inside each clip folder (clip_*/feature_maps/vjepa2_vitl16.npy) instead of a central directory.",
     )
     parser.add_argument(
         "--batch_size",
@@ -210,12 +348,23 @@ def main() -> int:
         default=None,
         help="Optional path to write a JSON timing report.",
     )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Limit encoding to first N clips (useful for CPU testing).",
+    )
     args = parser.parse_args()
 
     torch, Image = _require_imports()
 
     data_dir: Path = args.data_dir
-    if args.out_dir is None:
+    in_place_mode = args.in_place
+
+    if in_place_mode:
+        out_dir = None  # Will save to clip_dir/feature_maps/
+        print("Mode: In-place (saving to clip_*/feature_maps/vjepa2_vitl16.npy)")
+    elif args.out_dir is None:
         out_dir = data_dir / "embeddings_vjepa2_vitl16"
     else:
         out_dir = args.out_dir
@@ -224,13 +373,15 @@ def main() -> int:
     if not clip_items:
         raise SystemExit(f"No clips found under: {data_dir}")
 
+    # Apply limit if specified (useful for CPU testing)
+    if args.limit is not None:
+        clip_items = clip_items[:args.limit]
+        print(f"Limiting to first {len(clip_items)} clip(s)")
+
     device_count = torch.cuda.device_count()
     device = torch.device("cuda" if device_count > 0 else "cpu")
     if device.type != "cuda":
-        raise SystemExit(
-            "No CUDA devices detected. This script is intended to run with GPUs. "
-            "If you want CPU encoding anyway, remove this guard."
-        )
+        print("WARNING: No CUDA devices detected. Using CPU (will be slow).")
 
     # Load preprocessor + model via torch.hub
     # - vjepa2_preprocessor returns eval transforms
@@ -243,8 +394,10 @@ def main() -> int:
     if device_count > 1:
         model = torch.nn.DataParallel(model)
         print(f"Using DataParallel across {device_count} GPUs")
-    else:
+    elif device.type == "cuda":
         print("Using single GPU")
+    else:
+        print("Using CPU")
 
     # Simple manual batching to keep per-item metadata for saving.
     batches = _batched(clip_items, max(1, args.batch_size))
@@ -256,7 +409,8 @@ def main() -> int:
     warm_x = warm_tensor.unsqueeze(0).to(device, non_blocking=True)
     with torch.inference_mode():
         _ = model(warm_x)
-    torch.cuda.synchronize()
+    if device.type == "cuda":
+        torch.cuda.synchronize()
 
     t0 = time.perf_counter()
     total_clips = 0
@@ -275,7 +429,10 @@ def main() -> int:
         # Skip logic (all-or-nothing per item)
         batch_to_run: List[ClipItem] = []
         for item in batch:
-            out_path = out_dir / f"{item.clip_id}.npy"
+            if in_place_mode:
+                out_path = item.clip_dir / "feature_maps" / "vjepa2_vitl16.npy"
+            else:
+                out_path = out_dir / f"{item.clip_id}.npy"
             if out_path.exists() and not args.overwrite:
                 skipped_clips += 1
             else:
@@ -297,13 +454,17 @@ def main() -> int:
         t_e0 = time.perf_counter()
         with torch.inference_mode():
             out = model(x)
-        torch.cuda.synchronize()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         encode_time += time.perf_counter() - t_e0
 
         # Save
         t_s0 = time.perf_counter()
         for item, emb in zip(batch_to_run, out):
-            out_path = out_dir / f"{item.clip_id}.npy"
+            if in_place_mode:
+                out_path = item.clip_dir / "feature_maps" / "vjepa2_vitl16.npy"
+            else:
+                out_path = out_dir / f"{item.clip_id}.npy"
             _save_embedding(out_path, emb, dtype=args.dtype)
             saved_clips += 1
         save_time += time.perf_counter() - t_s0
@@ -321,7 +482,7 @@ def main() -> int:
     print("V-JEPA2 ENCODING SUMMARY")
     print("=" * 60)
     print(f"Data dir:           {data_dir}")
-    print(f"Output dir:         {out_dir}")
+    print(f"Output mode:        {'in-place (clip_*/feature_maps/)' if in_place_mode else str(out_dir)}")
     print(f"Clips discovered:   {len(clip_items)}")
     print(f"Clips saved:        {saved_clips}")
     print(f"Clips skipped:      {skipped_clips}")
