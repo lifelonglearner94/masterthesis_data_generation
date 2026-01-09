@@ -26,19 +26,20 @@ _project_root = Path(__file__).resolve().parent.parent.parent
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
-# Import shared utilities - ensure dependencies before other imports
+# Ensure dependencies FIRST before importing utils (which needs yaml)
+from experiments.scripts.utils import ensure_dependencies
+ensure_dependencies()
+
+# Now safe to import the rest of utils (yaml is now available)
 from experiments.scripts.utils import (
     EXIT_SUCCESS,
     EXIT_GENERAL_ERROR,
     EXIT_VRAM_ERROR,
-    ensure_dependencies,
     check_gpu_available,
     get_gpu_vram_usage,
     load_physics_config,
     get_total_clips_from_config,
 )
-
-ensure_dependencies()
 
 import argparse
 import json

@@ -13,7 +13,8 @@ import sys
 from pathlib import Path
 from typing import Tuple
 
-import yaml
+# yaml is imported lazily after ensure_dependencies() is called
+yaml = None  # type: ignore
 
 # ============================================================================
 # Exit codes (shared between worker and manager)
@@ -92,11 +93,17 @@ def ensure_dependencies() -> None:
     where network access to PyPI can be flaky. Prefers apt packages when
     available and falls back to pip with higher timeouts/retries.
     """
+    global yaml
+
     # pyyaml
     if not _has_module("yaml"):
         print("Dependency missing: pyyaml (yaml). Installing...")
         if not (_try_apt_install("python3-yaml") or _try_pip_install("pyyaml")):
             raise RuntimeError("Failed to install dependency: pyyaml")
+
+    # Import yaml now that it's available
+    import yaml as _yaml
+    yaml = _yaml
 
     # numpy
     if not _has_module("numpy"):
