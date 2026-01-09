@@ -62,9 +62,8 @@ force:
   # Magnitude range (Newtons) - tuned for ~1 second of visible motion
   magnitude_min: 3.0
   magnitude_max: 4.5
-  # Direction constraints (applied on XY plane primarily)
+  # Direction constraints (applied on XY plane only - 2D force)
   apply_at_frame: 1  # Apply force between frame 1 and 2
-  z_component_range: [0, 0]  # Small vertical component -> NO VERTICAL SPEED !!!!!!!
 
 
 # Dataset phase configuration
