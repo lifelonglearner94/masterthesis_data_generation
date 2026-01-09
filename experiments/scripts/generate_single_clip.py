@@ -44,6 +44,12 @@ def _apply_thread_limits():
 _apply_thread_limits()
 
 import sys
+from pathlib import Path
+
+# Add project root to path for imports when running from workspace
+_project_root = Path(__file__).resolve().parent.parent.parent
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
 
 # Import shared utilities and ensure dependencies before other imports
 from experiments.scripts.utils import (
