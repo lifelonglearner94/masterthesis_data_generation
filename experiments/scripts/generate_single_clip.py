@@ -359,9 +359,9 @@ def sample_physics_parameters(config: dict, friction_category: str, mass_mode: s
     else:  # fixed
         object_mass = obj_config.get("mass_fixed", 1.0)
 
-    # Sample restitution
-    rest_config = config["restitution"]
-    restitution = np.random.uniform(rest_config["min"], rest_config["max"])
+    # Sample restitution (optional in YAML)
+    rest_config = config.get("restitution") or {"min": 0.1, "max": 0.4}
+    restitution = np.random.uniform(float(rest_config.get("min", 0.1)), float(rest_config.get("max", 0.4)))
 
     # Sample force vector
     force_config = config["force"]
@@ -672,14 +672,13 @@ def apply_floor_texture_material(
 
 def create_walls(scene: "kb.Scene", config: dict) -> None:
     """Create arena walls to contain the cube."""
-    wall_config = config["walls"]
-
-    if not wall_config["enabled"]:
+    wall_config = config.get("walls") or {}
+    if not bool(wall_config.get("enabled", False)):
         return
 
-    arena_size = wall_config["arena_size"]
-    thickness = wall_config["thickness"]
-    height = wall_config["height"]
+    arena_size = float(wall_config.get("arena_size", 26.0))
+    thickness = float(wall_config.get("thickness", 0.1))
+    height = float(wall_config.get("height", 1.0))
 
     wall_positions = [
         ("wall_north", (0, arena_size/2, height/2), (arena_size, thickness, height)),
@@ -695,8 +694,8 @@ def create_walls(scene: "kb.Scene", config: dict) -> None:
             scale=scale,
             static=True,
         )
-        wall.friction = wall_config["friction"]
-        wall.restitution = wall_config["restitution"]
+        wall.friction = float(wall_config.get("friction", 0.8))
+        wall.restitution = float(wall_config.get("restitution", 0.3))
         wall.material = kb.PrincipledBSDFMaterial(
             name=f"{name}_material",
             color=kb.Color(0.3, 0.3, 0.35),
