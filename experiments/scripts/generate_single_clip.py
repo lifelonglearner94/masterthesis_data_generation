@@ -43,66 +43,23 @@ def _apply_thread_limits():
 
 _apply_thread_limits()
 
-import shutil
-import subprocess
 import sys
 
+# Import shared utilities and ensure dependencies before other imports
+from experiments.scripts.utils import (
+    EXIT_SUCCESS,
+    EXIT_GENERAL_ERROR,
+    EXIT_VRAM_ERROR,
+    ensure_dependencies,
+    check_gpu_available,
+    load_physics_config,
+)
 
-def _ensure_dependencies():
-    """Ensure minimal runtime deps exist.
-
-    This worker usually runs inside the Kubric Docker image. PyPI access can be
-    slow/flaky there, so we prefer apt packages when available and fall back to
-    pip with increased timeouts/retries.
-    """
-
-    def _has_module(import_name: str) -> bool:
-        try:
-            __import__(import_name)
-            return True
-        except ImportError:
-            return False
-
-    def _try_apt_install(apt_pkg: str) -> bool:
-        if shutil.which("apt-get") is None:
-            return False
-        try:
-            subprocess.run(["apt-get", "update"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
-            subprocess.run(["apt-get", "install", "-y", apt_pkg], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
-            return True
-        except Exception:
-            return False
-
-    def _try_pip_install(pip_pkg: str) -> bool:
-        env = dict(os.environ)
-        env.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
-        env.setdefault("PIP_DEFAULT_TIMEOUT", "120")
-        cmd = [sys.executable, "-m", "pip", "install", "--retries", "10", "--default-timeout", "120", pip_pkg]
-        try:
-            subprocess.run(cmd, check=True, env=env, timeout=600)
-            return True
-        except Exception:
-            return False
-
-    # pyyaml
-    if not _has_module("yaml"):
-        print("Dependency missing: pyyaml (yaml). Installing...")
-        if not (_try_apt_install("python3-yaml") or _try_pip_install("pyyaml")):
-            raise RuntimeError("Failed to install dependency: pyyaml")
-
-    # numpy
-    if not _has_module("numpy"):
-        print("Dependency missing: numpy. Installing...")
-        if not (_try_apt_install("python3-numpy") or _try_pip_install("numpy")):
-            raise RuntimeError("Failed to install dependency: numpy")
-
-
-_ensure_dependencies()
+ensure_dependencies()
 
 import argparse
 import json
 import logging
-import os
 import random
 import shutil
 from pathlib import Path
@@ -127,11 +84,6 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
-
-# Exit codes matching manager_benchmark.py expectations
-EXIT_SUCCESS = 0
-EXIT_GENERAL_ERROR = 1
-EXIT_VRAM_ERROR = 2  # GPU memory exhaustion - retriable after cooldown
 
 # Error patterns that indicate VRAM exhaustion
 VRAM_ERROR_PATTERNS = [
@@ -180,27 +132,6 @@ def log_thread_configuration() -> None:
     logger.debug(f"Thread configuration: {config_str}")
 
 
-def check_gpu_available() -> bool:
-    """Check if NVIDIA GPU is available via nvidia-smi."""
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        if result.returncode == 0:
-            gpu_name = result.stdout.strip()
-            logger.info(f"GPU detected: {gpu_name}")
-            return True
-        else:
-            logger.warning("nvidia-smi returned non-zero exit code")
-            return False
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        logger.warning(f"GPU check failed: {e}")
-        return False
-
-
 def set_deterministic_seed(seed: int) -> None:
     """
     Set seed for all random number generators to ensure reproducibility.
@@ -215,14 +146,6 @@ def set_deterministic_seed(seed: int) -> None:
     os.environ["PYTHONHASHSEED"] = str(seed)
 
     logger.info(f"Set deterministic seed: {seed}")
-
-
-def load_physics_config(config_path: str) -> dict:
-    """Load physics configuration from YAML file."""
-    with open(config_path, "r") as f:
-        config = yaml.safe_load(f)
-    logger.info(f"Loaded physics config from: {config_path}")
-    return config
 
 
 def determine_friction_category(job_id: int, config: dict) -> str:
@@ -252,18 +175,10 @@ def determine_friction_category(job_id: int, config: dict) -> str:
             logger.warning(f"Job ID {job_id} outside defined ranges, defaulting to 'normal'")
             return "normal"
 
-    # Fallback to legacy range-based logic
-    normal_range = config["dataset"]["normal_range"]
-    slippery_range = config["dataset"]["slippery_range"]
-
-    if normal_range[0] <= job_id <= normal_range[1]:
-        return "normal"
-    elif slippery_range[0] <= job_id <= slippery_range[1]:
-        return "slippery"
-    else:
-        # Default to normal for out-of-range job IDs
-        logger.warning(f"Job ID {job_id} outside defined ranges, defaulting to 'normal'")
-        return "normal"
+    # No phase configuration found
+    raise ValueError(
+        f"Missing phase configuration in config. Expected 'phase_a1', 'phase_b', 'phase_a2' in dataset config."
+    )
 
 
 def determine_mass_mode(job_id: int, config: dict) -> str:
@@ -293,8 +208,10 @@ def determine_mass_mode(job_id: int, config: dict) -> str:
             logger.warning(f"Job ID {job_id} outside defined ranges, defaulting to 'random'")
             return "random"
 
-    # Legacy: always random mass
-    return "random"
+    # No phase configuration found
+    raise ValueError(
+        f"Missing phase configuration in config. Expected 'phase_a1', 'phase_b', 'phase_a2' in dataset config."
+    )
 
 
 def determine_phase(job_id: int, config: dict) -> str:
@@ -359,10 +276,6 @@ def sample_physics_parameters(config: dict, friction_category: str, mass_mode: s
     else:  # fixed
         object_mass = obj_config.get("mass_fixed", 1.0)
 
-    # Sample restitution (optional in YAML)
-    rest_config = config.get("restitution") or {"min": 0.1, "max": 0.4}
-    restitution = np.random.uniform(float(rest_config.get("min", 0.1)), float(rest_config.get("max", 0.4)))
-
     # Sample force vector
     force_config = config["force"]
     force_magnitude = np.random.uniform(
@@ -394,7 +307,6 @@ def sample_physics_parameters(config: dict, friction_category: str, mass_mode: s
         "mass_mode": mass_mode,
         "object_size": float(object_size),
         "object_mass": float(object_mass),
-        "restitution": float(restitution),
         "force_vector": {
             "x": float(force_x),
             "y": float(force_y),
@@ -515,7 +427,7 @@ def setup_environment(scene: "kb.Scene", config: dict) -> None:
     scene.add(fill_light)
 
 
-def create_floor(scene: "kb.Scene", config: dict, parameters: dict) -> None:
+def create_floor(scene: "kb.Scene", config: dict, parameters: dict) -> "kb.Cube":
     """Create the physical floor object.
 
     Note: The *visual* floor texture is applied later (after the Blender renderer
@@ -523,8 +435,8 @@ def create_floor(scene: "kb.Scene", config: dict, parameters: dict) -> None:
     default. We intentionally do NOT assign a Kubric material here, as it interferes
     with our custom Blender node-based texture material.
     """
-    wall_config = config.get("walls", {})
-    arena_size = float(wall_config.get("arena_size", 10.0))
+    obj_config = config.get("object", {})
+    arena_size = float(obj_config.get("arena_size", 10.0))
 
     # Create floor plane (make sure it covers the arena).
     floor = kb.Cube(
@@ -536,7 +448,6 @@ def create_floor(scene: "kb.Scene", config: dict, parameters: dict) -> None:
 
     # Set floor friction
     floor.friction = parameters["friction_coefficient"]
-    floor.restitution = parameters["restitution"]
 
     # NOTE: Do NOT assign a Kubric material here!
     # The floor texture will be applied directly via Blender nodes in
@@ -670,41 +581,6 @@ def apply_floor_texture_material(
     logger.info(f"Applied floor texture: {texture_path}")
 
 
-def create_walls(scene: "kb.Scene", config: dict) -> None:
-    """Create arena walls to contain the cube."""
-    wall_config = config.get("walls") or {}
-    if not bool(wall_config.get("enabled", False)):
-        return
-
-    arena_size = float(wall_config.get("arena_size", 26.0))
-    thickness = float(wall_config.get("thickness", 0.1))
-    height = float(wall_config.get("height", 1.0))
-
-    wall_positions = [
-        ("wall_north", (0, arena_size/2, height/2), (arena_size, thickness, height)),
-        ("wall_south", (0, -arena_size/2, height/2), (arena_size, thickness, height)),
-        ("wall_east", (arena_size/2, 0, height/2), (thickness, arena_size, height)),
-        ("wall_west", (-arena_size/2, 0, height/2), (thickness, arena_size, height)),
-    ]
-
-    for name, position, scale in wall_positions:
-        wall = kb.Cube(
-            name=name,
-            position=position,
-            scale=scale,
-            static=True,
-        )
-        wall.friction = float(wall_config.get("friction", 0.8))
-        wall.restitution = float(wall_config.get("restitution", 0.3))
-        wall.material = kb.PrincipledBSDFMaterial(
-            name=f"{name}_material",
-            color=kb.Color(0.3, 0.3, 0.35),
-        )
-        scene.add(wall)
-
-    logger.info("Created arena walls")
-
-
 def sample_initial_cube_position_xy(config: dict, cube_size: float) -> tuple[float, float]:
     """Sample a random initial (x, y) position for the cube near the arena center.
 
@@ -715,17 +591,14 @@ def sample_initial_cube_position_xy(config: dict, cube_size: float) -> tuple[flo
 
     The sampled position is clamped to stay inside the arena bounds.
     """
-    walls_cfg = config.get("walls", {}) or {}
-    arena_size = float(walls_cfg.get("arena_size", 2.5))
-    walls_enabled = bool(walls_cfg.get("enabled", False))
-    wall_thickness = float(walls_cfg.get("thickness", 0.0)) if walls_enabled else 0.0
+    obj_cfg = config.get("object", {}) or {}
+    arena_size = float(obj_cfg.get("arena_size", 10.0))
 
-    # Keep cube fully inside arena even with walls present
-    max_abs_xy = arena_size / 2.0 - wall_thickness - cube_size / 2.0
+    # Keep cube fully inside arena
+    max_abs_xy = arena_size / 2.0 - cube_size / 2.0
     if max_abs_xy <= 0:
         return 0.0, 0.0
 
-    obj_cfg = config.get("object", {}) or {}
     init_cfg = obj_cfg.get("initial_position", {}) or {}
 
     x_low = x_high = y_low = y_high = None
@@ -791,7 +664,6 @@ def create_dynamic_cube(scene: "kb.Scene", config: dict, parameters: dict) -> "k
     )
 
     cube.friction = parameters["friction_coefficient"]
-    cube.restitution = parameters["restitution"]
 
     cube.material = kb.PrincipledBSDFMaterial(
         name="cube_material",
@@ -1026,24 +898,6 @@ def render_scene(
         kb.write_png(frame[..., :3], frame_path)  # RGB only, no alpha
         rgb_paths.append(str(frame_path))
 
-    # NOTE: Flow and segmentation saving disabled - only metadata needed
-    # # Save optical flow as numpy arrays (preserves float precision and 2-channel data)
-    # # Flow has shape (H, W, 2) for x and y components
-    # flow_paths = []
-    # for i, flow in enumerate(frames["forward_flow"]):
-    #     flow_path = directories["flow"] / f"flow_{i:05d}.npy"
-    #     np.save(flow_path, flow)
-    #     flow_paths.append(str(flow_path))
-    #
-    # # Save segmentation masks
-    # seg_paths = []
-    # for i, seg in enumerate(frames["segmentation"]):
-    #     seg_path = directories["segmentation"] / f"seg_{i:05d}.png"
-    #     kb.write_png(seg, seg_path)
-    #     seg_paths.append(str(seg_path))
-    flow_paths = []
-    seg_paths = []
-
     # Create a quick GIF preview for visual appeal (not for analysis)
     # Skip in production mode to save time
     gif_path = None
@@ -1081,8 +935,6 @@ def render_scene(
 
     return {
         "rgb_frames": rgb_paths,
-        "flow_frames": flow_paths,  # Empty - disabled
-        "segmentation_frames": seg_paths,  # Empty - disabled
         "gif_preview": str(gif_path) if gif_path else None,
     }
 
@@ -1105,7 +957,6 @@ def save_ground_truth(
         "physics": {
             "friction_coefficient": parameters["friction_coefficient"],
             "mass": parameters["object_mass"],
-            "restitution": parameters["restitution"],
             "object_size": parameters["object_size"],
         },
         "force": {
@@ -1241,9 +1092,8 @@ def generate_clip(
     # Setup environment (lighting)
     setup_environment(scene, config)
 
-    # Create floor and walls
+    # Create floor
     floor = create_floor(scene, config, parameters)
-    create_walls(scene, config)
 
     # Create dynamic object
     cube = create_dynamic_cube(scene, config, parameters)

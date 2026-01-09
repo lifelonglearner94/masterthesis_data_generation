@@ -378,26 +378,9 @@ def main() -> int:
         clip_items = clip_items[:args.limit]
         print(f"Limiting to first {len(clip_items)} clip(s)")
 
+    # Load encoder using singleton pattern
+    model, preprocessor, device, torch, Image = get_encoder(args.crop_size)
     device_count = torch.cuda.device_count()
-    device = torch.device("cuda" if device_count > 0 else "cpu")
-    if device.type != "cuda":
-        print("WARNING: No CUDA devices detected. Using CPU (will be slow).")
-
-    # Load preprocessor + model via torch.hub
-    # - vjepa2_preprocessor returns eval transforms
-    # - vjepa2_vit_large is ViT-L/16 encoder (pretrained)
-    preprocessor = torch.hub.load("facebookresearch/vjepa2", "vjepa2_preprocessor", crop_size=args.crop_size)
-    encoder, _predictor = torch.hub.load("facebookresearch/vjepa2", "vjepa2_vit_large")
-    model = encoder
-    model.eval().to(device)
-
-    if device_count > 1:
-        model = torch.nn.DataParallel(model)
-        print(f"Using DataParallel across {device_count} GPUs")
-    elif device.type == "cuda":
-        print("Using single GPU")
-    else:
-        print("Using CPU")
 
     # Simple manual batching to keep per-item metadata for saving.
     batches = _batched(clip_items, max(1, args.batch_size))

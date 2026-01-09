@@ -17,64 +17,22 @@ Usage:
 Author: Generated for Scientific Data Pipeline
 """
 
-import shutil
 import subprocess
 import sys
 
+# Import shared utilities - ensure dependencies before other imports
+from experiments.scripts.utils import (
+    EXIT_SUCCESS,
+    EXIT_GENERAL_ERROR,
+    EXIT_VRAM_ERROR,
+    ensure_dependencies,
+    check_gpu_available,
+    get_gpu_vram_usage,
+    load_physics_config,
+    get_total_clips_from_config,
+)
 
-def _ensure_dependencies():
-    """Ensure minimal runtime deps exist.
-
-    This script often runs inside the Kubric Docker image where network access
-    to PyPI can be flaky (pip ReadTimeout). Prefer installing via apt when
-    available and fall back to pip with higher timeouts/retries.
-    """
-
-    def _has_module(import_name: str) -> bool:
-        try:
-            __import__(import_name)
-            return True
-        except ImportError:
-            return False
-
-    def _try_apt_install(apt_pkg: str) -> bool:
-        if shutil.which("apt-get") is None:
-            return False
-        try:
-            subprocess.run(["apt-get", "update"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
-            subprocess.run(["apt-get", "install", "-y", apt_pkg], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
-            return True
-        except Exception:
-            return False
-
-    def _try_pip_install(pip_pkg: str) -> bool:
-        env = dict(os.environ)
-        env.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
-        env.setdefault("PIP_DEFAULT_TIMEOUT", "120")
-        cmd = [sys.executable, "-m", "pip", "install", "--retries", "10", "--default-timeout", "120", pip_pkg]
-        try:
-            subprocess.run(cmd, check=True, env=env, timeout=600)
-            return True
-        except Exception:
-            return False
-
-    # pyyaml
-    if not _has_module("yaml"):
-        print("Dependency missing: pyyaml (yaml). Installing...")
-        if not (_try_apt_install("python3-yaml") or _try_pip_install("pyyaml")):
-            raise RuntimeError("Failed to install dependency: pyyaml")
-
-    # numpy
-    if not _has_module("numpy"):
-        print("Dependency missing: numpy. Installing...")
-        if not (_try_apt_install("python3-numpy") or _try_pip_install("numpy")):
-            raise RuntimeError("Failed to install dependency: numpy")
-
-
-# Ensure dependencies before importing them.
-import os
-
-_ensure_dependencies()
+ensure_dependencies()
 
 import argparse
 import json
@@ -83,11 +41,11 @@ import os
 import random
 import threading
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import yaml
 
@@ -101,11 +59,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Exit codes for worker script
-EXIT_SUCCESS = 0
-EXIT_GENERAL_ERROR = 1
-EXIT_VRAM_ERROR = 2  # GPU memory exhaustion - retriable after cooldown
-
 # VRAM monitoring thresholds
 VRAM_HIGH_THRESHOLD = 0.85  # Pause submission above 85% usage
 VRAM_LOW_THRESHOLD = 0.70   # Resume submission below 70% usage
@@ -117,33 +70,6 @@ def get_default_workers() -> int:
     """Calculate default worker count based on CPU cores."""
     cpu_count = os.cpu_count() or 4
     return max(1, cpu_count - 2)
-
-
-def get_gpu_vram_usage() -> Tuple[float, float, float]:
-    """
-    Query GPU VRAM usage via nvidia-smi.
-
-    Returns:
-        Tuple of (used_mb, total_mb, usage_fraction) or (0, 0, 0) if unavailable
-    """
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        if result.returncode == 0:
-            # Parse "1234, 8192" format
-            parts = result.stdout.strip().split(", ")
-            if len(parts) >= 2:
-                used = float(parts[0])
-                total = float(parts[1])
-                fraction = used / total if total > 0 else 0
-                return used, total, fraction
-    except Exception as e:
-        logger.debug(f"VRAM query failed: {e}")
-    return 0.0, 0.0, 0.0
 
 
 def wait_for_vram_available(threshold: float = VRAM_HIGH_THRESHOLD) -> None:
@@ -240,41 +166,6 @@ class BenchmarkReport:
     max_time: float
     estimated_full_run: float  # In hours
     job_results: List[JobResult] = field(default_factory=list)
-
-
-def check_gpu_available() -> bool:
-    """Check if NVIDIA GPU is available via nvidia-smi."""
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        if result.returncode == 0:
-            gpu_info = result.stdout.strip()
-            logger.info(f"GPU detected: {gpu_info}")
-            return True
-        else:
-            logger.warning("nvidia-smi returned non-zero exit code")
-            return False
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        logger.warning(f"GPU check failed: {e}")
-        return False
-
-
-def load_physics_config(config_path: Path) -> dict:
-    """Load physics configuration from YAML file."""
-    with open(config_path, "r") as f:
-        config = yaml.safe_load(f)
-    return config
-
-
-def get_job_ranges(config: dict) -> tuple:
-    """Extract job ID ranges from config."""
-    normal_range = config["dataset"]["normal_range"]
-    slippery_range = config["dataset"]["slippery_range"]
-    return normal_range, slippery_range
 
 
 def run_single_job(
@@ -509,21 +400,9 @@ def run_benchmark(
         if a2_pool and phase_a2_samples > 0:
             test_job_ids.extend(random.sample(a2_pool, min(phase_a2_samples, len(a2_pool))))
     else:
-        # Fallback to legacy ranges
-        normal_range, slippery_range = get_job_ranges(config)
-
-        # Pick some from each category
-        normal_samples = min(num_test_jobs - 1, 4)
-        slippery_samples = num_test_jobs - normal_samples
-
-        # Sample from normal range
-        normal_pool = list(range(normal_range[0], min(normal_range[1] + 1, normal_range[0] + 1000)))
-        test_job_ids.extend(random.sample(normal_pool, min(normal_samples, len(normal_pool))))
-
-        # Sample from slippery range
-        slippery_pool = list(range(slippery_range[0], slippery_range[1] + 1))
-        if slippery_pool and slippery_samples > 0:
-            test_job_ids.extend(random.sample(slippery_pool, min(slippery_samples, len(slippery_pool))))
+        raise ValueError(
+            "Missing phase configuration in config. Expected 'phase_a1', 'phase_b', 'phase_a2' in dataset config."
+        )
 
     logger.info(f"Test job IDs: {test_job_ids}")
 
@@ -582,43 +461,6 @@ def run_benchmark(
     )
 
     return report
-
-
-def get_total_production_jobs_from_config(config: dict) -> int:
-    """Return total number of clips/jobs implied by the dataset config."""
-    dataset_cfg = config.get("dataset", {})
-
-    # Preferred schema: explicit total
-    if isinstance(dataset_cfg.get("total_clips"), int):
-        return int(dataset_cfg["total_clips"])
-
-    # Phase schema: sum the phase clip counts if present
-    phase_keys = ["phase_a1", "phase_b", "phase_a2"]
-    if all(k in dataset_cfg for k in phase_keys):
-        total = 0
-        for k in phase_keys:
-            phase = dataset_cfg.get(k, {})
-            if isinstance(phase.get("clips"), int):
-                total += int(phase["clips"])
-        if total > 0:
-            return total
-
-    # Legacy schema: normal/slippery clip counts
-    if "normal_clips" in dataset_cfg and "slippery_clips" in dataset_cfg:
-        return int(dataset_cfg["normal_clips"]) + int(dataset_cfg["slippery_clips"])
-
-    # Last resort: infer from ranges if available
-    if "phase_a1" in dataset_cfg and "range" in dataset_cfg["phase_a1"]:
-        # Use the max end across defined phase ranges
-        ends = []
-        for k in phase_keys:
-            phase = dataset_cfg.get(k, {})
-            if isinstance(phase.get("range"), (list, tuple)) and len(phase["range"]) == 2:
-                ends.append(int(phase["range"][1]))
-        if ends:
-            return max(ends) + 1
-
-    return 0
 
 
 def print_benchmark_report(report: BenchmarkReport, total_jobs: int):
@@ -1085,8 +927,8 @@ Examples:
     parser.add_argument(
         "--end_job",
         type=int,
-        default=16999,
-        help="Ending job ID for production (default: 16999, includes all phases)"
+        default=None,
+        help="Ending job ID for production (default: derived from config total_clips - 1)"
     )
 
     parser.add_argument(
@@ -1146,6 +988,17 @@ Examples:
         logger.error(f"Physics config not found: {physics_config}")
         sys.exit(1)
 
+    # Set default end_job from config if not specified
+    if args.end_job is None:
+        config = load_physics_config(physics_config)
+        total_clips = get_total_clips_from_config(config)
+        if total_clips > 0:
+            args.end_job = total_clips - 1
+            logger.info(f"Derived end_job={args.end_job} from config total_clips={total_clips}")
+        else:
+            args.end_job = 16999  # Fallback default
+            logger.warning(f"Could not determine total_clips from config, using default end_job={args.end_job}")
+
     # Create output directory
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1174,9 +1027,9 @@ Examples:
         # Benchmark mode
         logger.info("Running in BENCHMARK mode")
 
-        # Load config to get total job count (supports both phase-based and legacy schemas)
+        # Load config to get total job count
         config = load_physics_config(physics_config)
-        total_production = get_total_production_jobs_from_config(config)
+        total_production = get_total_clips_from_config(config)
         if total_production <= 0:
             logger.warning("Could not infer total production jobs from config; using end_job-start_job+1 fallback")
             total_production = args.end_job - args.start_job + 1
