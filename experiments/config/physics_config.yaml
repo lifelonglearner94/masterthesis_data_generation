@@ -49,7 +49,7 @@ object:
 friction:
   # Normal distribution (for Phase A_1 and A_2)
   normal:
-    min: 0.5
+    min: 0.6
     max: 0.9
   # Slippery / OOD distribution (for Phase B)
   slippery:
@@ -75,7 +75,7 @@ walls:
   enabled: false
   thickness: 0.1
   height: 1.0
-  arena_size: 12.0   # Increased from 2.5m to allow longer sliding distance
+  arena_size: 26.0   # Increased from 2.5m to allow longer sliding distance
   friction: 0.8
   restitution: 0.3
 
