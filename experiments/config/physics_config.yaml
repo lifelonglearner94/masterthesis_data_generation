@@ -6,34 +6,44 @@
 video:
   resolution: 256
   num_frames: 32
-  fps: 20
+  fps: 30             # Output video frame rate (previously it was 20)
   simulation_fps: 240  # Internal simulation rate
-  frame_step: 12       # Save every 12th step (240/20 = 12)
-  format: "mp4"
-  codec: "h264"
-  bitrate: "50M"       # High bitrate for scientific quality
 
 # Camera settings
 camera:
-  type: "static"
   angle_degrees: 45
-  distance: 12.0     # Increased to see larger arena
+  distance: 14.0     # Increased to see larger arena
   focal_length: 35
   sensor_width: 32
 
 # Environment
 environment:
-  background: "checkerboard"
-  checkerboard_scale: 0.5
+  floor_texture: "generate_grid_image/black_grid.png"  # Path relative to repo root
+  # Floor texture tiling settings for visible grid in physics simulations
+  floor_texture_tiling:
+    enabled: true       # When true, texture tiles/repeats across floor
+    scale: 3.0          # Number of tiles across floor (3 = ~4 meter grid cells for 12m arena)
   ambient_light: 0.3
   key_light_intensity: 1.0
 
 # Dynamic object (cube)
 object:
   type: "cube"
-  size_range: [0.3, 0.5]  # Random size between these values
+  size_range: [0.5, 0.8]  # Random size between these values
   mass_range: [0.5, 2.0]  # kg (used in Phase A_1)
   mass_fixed: 1.0         # kg (used in Phase B and A_2)
+  # Initial position of the cube (XY is centered around (0, 0))
+  #
+  # Notes:
+  # - Values are in meters in world coordinates.
+  # - The sampler will clamp these ranges so the cube always spawns inside the arena.
+  # - If omitted, defaults to spawning in the central 30% of the arena.
+  initial_position:
+    # Option A (explicit ranges):
+    x_range: [-1.0, 1.0]
+    y_range: [-1.0, 1.0]
+    # Option B (alternative): comment out x/y ranges and use a fraction of the arena size.
+    # xy_fraction_of_arena: 0.15
 
 # Friction settings
 friction:
@@ -43,7 +53,7 @@ friction:
     max: 0.9
   # Slippery / OOD distribution (for Phase B)
   slippery:
-    min: 0.01
+    min: 0.09
     max: 0.15
 
 # Restitution (bounciness)
@@ -55,17 +65,17 @@ restitution:
 force:
   # Magnitude range (Newtons) - tuned for ~1 second of visible motion
   magnitude_min: 3.0
-  magnitude_max: 15.0
+  magnitude_max: 4.5
   # Direction constraints (applied on XY plane primarily)
   apply_at_frame: 1  # Apply force between frame 1 and 2
-  z_component_range: [-1.0, 1.0]  # Small vertical component
+  z_component_range: [0, 0]  # Small vertical component -> NO VERTICAL SPEED !!!!!!!
 
 # Wall configuration
 walls:
-  enabled: true
+  enabled: false
   thickness: 0.1
   height: 1.0
-  arena_size: 10.0   # Increased from 2.5m to allow longer sliding distance
+  arena_size: 12.0   # Increased from 2.5m to allow longer sliding distance
   friction: 0.8
   restitution: 0.3
 
@@ -93,9 +103,3 @@ dataset:
 
   # Total clips
   total_clips: 17000
-
-  # Legacy compatibility (for backwards compat with range-based logic)
-  normal_clips: 16000        # Phase A_1 + A_2
-  slippery_clips: 1000       # Phase B
-  normal_range: [0, 14999]   # Phase A_1 (deprecated, use phase configs)
-  slippery_range: [15000, 15999]  # Phase B (deprecated, use phase configs)

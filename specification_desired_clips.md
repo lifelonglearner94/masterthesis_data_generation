@@ -2,11 +2,8 @@
 
 * **Resolution:** 256 x 256
 * **Clip length:** 32 F.
-* **Framerate:** 20 FPS
-* *(240Hz, but only save every 12th step)*
-
-
-* **Format:** .mp4 (All-intra or extremly high bitrate)
+* **Framerate:** 30 FPS
+* *(240Hz, but only save every 8th step)*
 
 ---
 

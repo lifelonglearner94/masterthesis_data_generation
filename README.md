@@ -36,7 +36,7 @@ The pipeline runs in two phases:
 
 ---
 
-## 📋 Option A: Test Scenario (5 Clips)
+## 📋 Option A: Test Scenario (6 Clips)
 
 Quick validation that everything works.
 
@@ -46,13 +46,15 @@ Quick validation that everything works.
 # From project root
 cd /path/to/masterthesis_data_generation
 
+# Ensure the floor texture exists (committed as generate_grid_image/black_grid.png).
+# If you regenerated/removed it, recreate it once:
+python3 generate_grid_image/generate_black_grid_png.py
+
 # Start Docker container with GPU and increased shared memory for parallel workers
 docker run --rm -it \
-    --gpus all \
     --shm-size=8g \
-    -v "$(pwd)/experiments/scripts:/scripts" \
-    -v "$(pwd)/experiments/config:/config" \
-    -v "$(pwd)/experiments/output:/output" \
+    -v "$(pwd):/workspace" \
+    -w /workspace \
     kubricdockerhub/kubruntu:latest \
     /bin/bash
 ```
@@ -60,11 +62,22 @@ docker run --rm -it \
 **Inside Docker container:**
 
 ```bash
-cd /scripts && python manager_benchmark.py \
+# If this is the first run in a fresh container, the scripts may install
+# `python3-yaml`/`python3-numpy` via apt (preferred) or fall back to pip.
+python experiments/scripts/manager_benchmark.py \
     --test \
-    --test_clips 5 \
     --seed 42 \
-    --output_dir /output/test_5clips
+    --test_a1_clips 3 \
+    --test_b_clips 3 \
+    --test_a2_clips 0 \
+    --output_dir experiments/output/test_6clips
+```
+
+If your environment blocks outbound PyPI access and dependency installation fails,
+run this once inside the container and retry:
+
+```bash
+apt-get update && apt-get install -y python3-yaml python3-numpy
 ```
 
 Then exit Docker with `exit`.
@@ -72,14 +85,14 @@ Then exit Docker with `exit`.
 ### Step 2: Fix Permissions (Local)
 
 ```bash
-sudo chown -R $USER:$USER experiments/output/test_5clips
+sudo chown -R $USER:$USER experiments/output/test_6clips
 ```
 
 ### Step 3: Encode with V-JEPA2 (Local)
 
 ```bash
 uv run experiments/scripts/encode_benchmark_vjepa2.py \
-    --data_dir experiments/output/test_5clips \
+    --data_dir experiments/output/test_6clips \
     --in_place \
     --batch_size 4
 ```
@@ -88,10 +101,10 @@ uv run experiments/scripts/encode_benchmark_vjepa2.py \
 
 ```bash
 # Check that feature maps were created
-ls experiments/output/test_5clips/clip_*/feature_maps/
+ls experiments/output/test_6clips/clip_*/feature_maps/
 
-# Inspect a feature map
-python -c "import numpy as np; a = np.load('experiments/output/test_5clips/clip_00654/feature_maps/vjepa2_vitl16.npy'); print(f'Shape: {a.shape}, Dtype: {a.dtype}')"
+# Inspect the first feature map found
+python -c "import glob, numpy as np; p = sorted(glob.glob('experiments/output/test_6clips/clip_*/feature_maps/vjepa2_vitl16.npy'))[0]; a = np.load(p); print(f'File: {p} | Shape: {a.shape} | Dtype: {a.dtype}')"
 ```
 
 ---
@@ -109,14 +122,17 @@ Generate the complete A-B-A dataset:
 # From project root
 cd /path/to/masterthesis_data_generation
 
+# Ensure the floor texture exists (committed as generate_grid_image/black_grid.png).
+# If you regenerated/removed it, recreate it once:
+python3 generate_grid_image/generate_black_grid_png.py
+
 # Start Docker container with GPU and increased shared memory for parallel workers
 # NOTE: --shm-size=8g is REQUIRED for parallel execution
 docker run --rm -it \
     --gpus all \
     --shm-size=8g \
-    -v "$(pwd)/experiments/scripts:/scripts" \
-    -v "$(pwd)/experiments/config:/config" \
-    -v "$(pwd)/experiments/output:/output" \
+    -v "$(pwd):/workspace" \
+    -w /workspace \
     kubricdockerhub/kubruntu:latest \
     /bin/bash
 ```
@@ -125,9 +141,9 @@ docker run --rm -it \
 
 ```bash
 # Use parallel workers for faster generation (saturates CPU/GPU pipeline)
-cd /scripts && python manager_benchmark.py \
+python experiments/scripts/manager_benchmark.py \
     --seed 42 \
-    --output_dir /output/friction_dataset_v1 \
+    --output_dir experiments/output/friction_dataset_v1 \
     --start_job 0 \
     --end_job 16999 \
     --workers 4 \

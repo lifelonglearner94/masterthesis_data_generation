@@ -17,22 +17,62 @@ Usage:
 Author: Generated for Scientific Data Pipeline
 """
 
+import shutil
 import subprocess
 import sys
 
-# Auto-install missing dependencies
+
 def _ensure_dependencies():
-    """Install required packages if missing."""
-    required = ["pyyaml", "numpy"]
-    for pkg in required:
+    """Ensure minimal runtime deps exist.
+
+    This script often runs inside the Kubric Docker image where network access
+    to PyPI can be flaky (pip ReadTimeout). Prefer installing via apt when
+    available and fall back to pip with higher timeouts/retries.
+    """
+
+    def _has_module(import_name: str) -> bool:
         try:
-            __import__("yaml" if pkg == "pyyaml" else pkg)
+            __import__(import_name)
+            return True
         except ImportError:
-            print(f"Installing {pkg}...")
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "-q", pkg],
-                stdout=subprocess.DEVNULL
-            )
+            return False
+
+    def _try_apt_install(apt_pkg: str) -> bool:
+        if shutil.which("apt-get") is None:
+            return False
+        try:
+            subprocess.run(["apt-get", "update"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
+            subprocess.run(["apt-get", "install", "-y", apt_pkg], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
+            return True
+        except Exception:
+            return False
+
+    def _try_pip_install(pip_pkg: str) -> bool:
+        env = dict(os.environ)
+        env.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+        env.setdefault("PIP_DEFAULT_TIMEOUT", "120")
+        cmd = [sys.executable, "-m", "pip", "install", "--retries", "10", "--default-timeout", "120", pip_pkg]
+        try:
+            subprocess.run(cmd, check=True, env=env, timeout=600)
+            return True
+        except Exception:
+            return False
+
+    # pyyaml
+    if not _has_module("yaml"):
+        print("Dependency missing: pyyaml (yaml). Installing...")
+        if not (_try_apt_install("python3-yaml") or _try_pip_install("pyyaml")):
+            raise RuntimeError("Failed to install dependency: pyyaml")
+
+    # numpy
+    if not _has_module("numpy"):
+        print("Dependency missing: numpy. Installing...")
+        if not (_try_apt_install("python3-numpy") or _try_pip_install("numpy")):
+            raise RuntimeError("Failed to install dependency: numpy")
+
+
+# Ensure dependencies before importing them.
+import os
 
 _ensure_dependencies()
 
@@ -385,7 +425,10 @@ def run_benchmark(
     physics_config: Path,
     num_test_jobs: int = 5,
     total_production_jobs: int = 16000,
-    dry_run: bool = False
+    dry_run: bool = False,
+    test_phase_a1_clips: Optional[int] = None,
+    test_phase_b_clips: Optional[int] = None,
+    test_phase_a2_clips: Optional[int] = None,
 ) -> BenchmarkReport:
     """
     Run a benchmark test with a small number of clips.
@@ -402,6 +445,31 @@ def run_benchmark(
     Returns:
         BenchmarkReport with timing statistics
     """
+    # Allow explicit control over how many samples come from each dataset phase.
+    # If any are provided, missing phases default to 0 and the total overrides num_test_jobs.
+    if any(v is not None for v in (test_phase_a1_clips, test_phase_b_clips, test_phase_a2_clips)):
+        test_phase_a1_clips = int(test_phase_a1_clips or 0)
+        test_phase_b_clips = int(test_phase_b_clips or 0)
+        test_phase_a2_clips = int(test_phase_a2_clips or 0)
+
+        if test_phase_a1_clips < 0 or test_phase_b_clips < 0 or test_phase_a2_clips < 0:
+            raise ValueError("Phase clip counts must be non-negative")
+
+        requested_total = test_phase_a1_clips + test_phase_b_clips + test_phase_a2_clips
+        if requested_total <= 0:
+            raise ValueError("At least one test clip must be requested")
+
+        if requested_total != num_test_jobs:
+            logger.info(
+                "Overriding --test_clips=%s with explicit phase counts total=%s (A1=%s, B=%s, A2=%s)",
+                num_test_jobs,
+                requested_total,
+                test_phase_a1_clips,
+                test_phase_b_clips,
+                test_phase_a2_clips,
+            )
+        num_test_jobs = requested_total
+
     logger.info(f"Starting benchmark with {num_test_jobs} test clips...")
 
     # Sample random job IDs to cover all phases
@@ -416,10 +484,16 @@ def run_benchmark(
         phase_b = config["dataset"]["phase_b"]
         phase_a2 = config["dataset"]["phase_a2"]
 
-        # Distribute samples across phases (prioritize Phase A_1, then one each from B and A_2)
-        phase_a1_samples = max(1, num_test_jobs - 2)
-        phase_b_samples = 1
-        phase_a2_samples = min(1, num_test_jobs - phase_a1_samples - phase_b_samples)
+        # Distribute samples across phases.
+        # Default behavior (legacy): prioritize Phase A_1, then one each from B and A_2.
+        if any(v is not None for v in (test_phase_a1_clips, test_phase_b_clips, test_phase_a2_clips)):
+            phase_a1_samples = int(test_phase_a1_clips or 0)
+            phase_b_samples = int(test_phase_b_clips or 0)
+            phase_a2_samples = int(test_phase_a2_clips or 0)
+        else:
+            phase_a1_samples = max(1, num_test_jobs - 2)
+            phase_b_samples = 1
+            phase_a2_samples = min(1, num_test_jobs - phase_a1_samples - phase_b_samples)
 
         # Sample from Phase A_1
         a1_pool = list(range(phase_a1["range"][0], min(phase_a1["range"][1] + 1, phase_a1["range"][0] + 1000)))
@@ -508,6 +582,43 @@ def run_benchmark(
     )
 
     return report
+
+
+def get_total_production_jobs_from_config(config: dict) -> int:
+    """Return total number of clips/jobs implied by the dataset config."""
+    dataset_cfg = config.get("dataset", {})
+
+    # Preferred schema: explicit total
+    if isinstance(dataset_cfg.get("total_clips"), int):
+        return int(dataset_cfg["total_clips"])
+
+    # Phase schema: sum the phase clip counts if present
+    phase_keys = ["phase_a1", "phase_b", "phase_a2"]
+    if all(k in dataset_cfg for k in phase_keys):
+        total = 0
+        for k in phase_keys:
+            phase = dataset_cfg.get(k, {})
+            if isinstance(phase.get("clips"), int):
+                total += int(phase["clips"])
+        if total > 0:
+            return total
+
+    # Legacy schema: normal/slippery clip counts
+    if "normal_clips" in dataset_cfg and "slippery_clips" in dataset_cfg:
+        return int(dataset_cfg["normal_clips"]) + int(dataset_cfg["slippery_clips"])
+
+    # Last resort: infer from ranges if available
+    if "phase_a1" in dataset_cfg and "range" in dataset_cfg["phase_a1"]:
+        # Use the max end across defined phase ranges
+        ends = []
+        for k in phase_keys:
+            phase = dataset_cfg.get(k, {})
+            if isinstance(phase.get("range"), (list, tuple)) and len(phase["range"]) == 2:
+                ends.append(int(phase["range"][1]))
+        if ends:
+            return max(ends) + 1
+
+    return 0
 
 
 def print_benchmark_report(report: BenchmarkReport, total_jobs: int):
@@ -944,6 +1055,27 @@ Examples:
     )
 
     parser.add_argument(
+        "--test_a1_clips",
+        type=int,
+        default=None,
+        help="In --test mode: number of clips sampled from Phase A_1 (overrides distribution if set)"
+    )
+
+    parser.add_argument(
+        "--test_b_clips",
+        type=int,
+        default=None,
+        help="In --test mode: number of clips sampled from Phase B (overrides distribution if set)"
+    )
+
+    parser.add_argument(
+        "--test_a2_clips",
+        type=int,
+        default=None,
+        help="In --test mode: number of clips sampled from Phase A_2 (overrides distribution if set)"
+    )
+
+    parser.add_argument(
         "--start_job",
         type=int,
         default=0,
@@ -1042,11 +1174,12 @@ Examples:
         # Benchmark mode
         logger.info("Running in BENCHMARK mode")
 
-        # Load config to get total job count
+        # Load config to get total job count (supports both phase-based and legacy schemas)
         config = load_physics_config(physics_config)
-        total_normal = config["dataset"]["normal_clips"]
-        total_slippery = config["dataset"]["slippery_clips"]
-        total_production = total_normal + total_slippery
+        total_production = get_total_production_jobs_from_config(config)
+        if total_production <= 0:
+            logger.warning("Could not infer total production jobs from config; using end_job-start_job+1 fallback")
+            total_production = args.end_job - args.start_job + 1
 
         report = run_benchmark(
             worker_script=worker_script,
@@ -1056,6 +1189,9 @@ Examples:
             num_test_jobs=args.test_clips,
             total_production_jobs=total_production,
             dry_run=args.dry_run,
+            test_phase_a1_clips=args.test_a1_clips,
+            test_phase_b_clips=args.test_b_clips,
+            test_phase_a2_clips=args.test_a2_clips,
         )
 
         print_benchmark_report(report, total_production)

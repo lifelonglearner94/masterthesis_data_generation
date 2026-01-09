@@ -43,23 +43,58 @@ def _apply_thread_limits():
 
 _apply_thread_limits()
 
+import shutil
 import subprocess
 import sys
 
-# Auto-install missing dependencies
-def _ensure_dependencies():
-    """Install required packages if missing."""
-    required = ["pyyaml", "numpy"]
-    for pkg in required:
-        try:
-            __import__("yaml" if pkg == "pyyaml" else pkg)
-        except ImportError:
-            print(f"Installing {pkg}...")
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "-q", pkg],
-                stdout=subprocess.DEVNULL
-            )
 
+def _ensure_dependencies():
+    """Ensure minimal runtime deps exist.
+
+    This worker usually runs inside the Kubric Docker image. PyPI access can be
+    slow/flaky there, so we prefer apt packages when available and fall back to
+    pip with increased timeouts/retries.
+    """
+
+    def _has_module(import_name: str) -> bool:
+        try:
+            __import__(import_name)
+            return True
+        except ImportError:
+            return False
+
+    def _try_apt_install(apt_pkg: str) -> bool:
+        if shutil.which("apt-get") is None:
+            return False
+        try:
+            subprocess.run(["apt-get", "update"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
+            subprocess.run(["apt-get", "install", "-y", apt_pkg], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
+            return True
+        except Exception:
+            return False
+
+    def _try_pip_install(pip_pkg: str) -> bool:
+        env = dict(os.environ)
+        env.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+        env.setdefault("PIP_DEFAULT_TIMEOUT", "120")
+        cmd = [sys.executable, "-m", "pip", "install", "--retries", "10", "--default-timeout", "120", pip_pkg]
+        try:
+            subprocess.run(cmd, check=True, env=env, timeout=600)
+            return True
+        except Exception:
+            return False
+
+    # pyyaml
+    if not _has_module("yaml"):
+        print("Dependency missing: pyyaml (yaml). Installing...")
+        if not (_try_apt_install("python3-yaml") or _try_pip_install("pyyaml")):
+            raise RuntimeError("Failed to install dependency: pyyaml")
+
+    # numpy
+    if not _has_module("numpy"):
+        print("Dependency missing: numpy. Installing...")
+        if not (_try_apt_install("python3-numpy") or _try_pip_install("numpy")):
+            raise RuntimeError("Failed to install dependency: numpy")
 
 
 _ensure_dependencies()
@@ -344,7 +379,7 @@ def sample_physics_parameters(config: dict, friction_category: str, mass_mode: s
         force_config["z_component_range"][1]
     )
 
-    # Sample object color (high contrast to checkerboard)
+    # Sample object color (high contrast to floor)
     # Avoid grays, prefer saturated colors
     hue = np.random.uniform(0, 1)
     # Convert HSV to RGB (saturation=0.9, value=0.9 for high contrast)
@@ -480,12 +515,21 @@ def setup_environment(scene: "kb.Scene", config: dict) -> None:
     scene.add(fill_light)
 
 
-def create_checkerboard_floor(scene: "kb.Scene", config: dict, parameters: dict) -> None:
-    """Create a checkerboard textured floor."""
-    # Create floor plane
+def create_floor(scene: "kb.Scene", config: dict, parameters: dict) -> None:
+    """Create the physical floor object.
+
+    Note: The *visual* floor texture is applied later (after the Blender renderer
+    is initialized), because Kubric's high-level material wrapper is uniform-color by
+    default. We intentionally do NOT assign a Kubric material here, as it interferes
+    with our custom Blender node-based texture material.
+    """
+    wall_config = config.get("walls", {})
+    arena_size = float(wall_config.get("arena_size", 10.0))
+
+    # Create floor plane (make sure it covers the arena).
     floor = kb.Cube(
         name="floor",
-        scale=(5, 5, 0.1),
+        scale=(arena_size, arena_size, 0.1),
         position=(0, 0, -0.05),
         static=True,
     )
@@ -494,15 +538,136 @@ def create_checkerboard_floor(scene: "kb.Scene", config: dict, parameters: dict)
     floor.friction = parameters["friction_coefficient"]
     floor.restitution = parameters["restitution"]
 
-    # Apply checkerboard material (Kubric handles this via Blender materials)
-    floor.material = kb.PrincipledBSDFMaterial(
-        name="floor_material",
-        color=kb.Color(0.8, 0.8, 0.8),  # Base color, checkerboard applied in Blender
-    )
+    # NOTE: Do NOT assign a Kubric material here!
+    # The floor texture will be applied directly via Blender nodes in
+    # apply_floor_texture_material() after the renderer is initialized.
+    # Assigning a Kubric PrincipledBSDFMaterial here would interfere with
+    # our custom texture material.
 
     scene.add(floor)
 
     logger.info(f"Created floor with friction={parameters['friction_coefficient']:.4f}")
+
+    return floor
+
+
+def apply_floor_texture_material(
+    renderer: "KubricRenderer",
+    floor: "kb.Cube",
+    config: dict,
+) -> None:
+    """Apply an image-based texture to the floor in Blender.
+
+    Kubric's `PrincipledBSDFMaterial` is a uniform material by default. To get a
+    visible texture, we build a Blender node graph using `ShaderNodeTexImage`.
+
+    This must run after `KubricRenderer(scene, ...)` is created, because that's when
+    the Blender objects exist and `floor.linked_objects[renderer]` is populated.
+
+    Uses 'Generated' coordinates which are automatically normalized to [0,1]
+    across the object's bounding box, making them ideal for image textures.
+    """
+    if not KUBRIC_AVAILABLE:
+        return
+
+    try:
+        from kubric.safeimport.bpy import bpy  # type: ignore
+    except Exception as exc:
+        logger.warning(f"Cannot import Blender bpy; floor texture disabled: {exc}")
+        return
+
+    env_config = config.get("environment", {})
+    texture_path_rel = env_config.get("floor_texture", "")
+
+    if not texture_path_rel:
+        logger.warning("No floor_texture configured; using default material")
+        return
+
+    # Resolve texture path relative to repo root (script is in experiments/scripts/)
+    script_dir = Path(__file__).resolve().parent
+    repo_root = script_dir.parent.parent
+    texture_path = repo_root / texture_path_rel
+
+    if not texture_path.exists():
+        logger.error(f"Floor texture not found: {texture_path}")
+        return
+
+    try:
+        blender_obj = floor.linked_objects[renderer]
+    except Exception as exc:
+        logger.warning(f"Floor not linked in Blender yet; floor texture disabled: {exc}")
+        return
+
+    # Build node-based image texture material
+    mat = bpy.data.materials.new("floor_texture")
+    mat.use_nodes = True
+    tree = mat.node_tree
+    nodes = tree.nodes
+    links = tree.links
+
+    # Clear default nodes
+    for node in list(nodes):
+        nodes.remove(node)
+
+    # Get tiling configuration
+    tiling_config = env_config.get("floor_texture_tiling", {})
+    tiling_enabled = tiling_config.get("enabled", False)
+    tiling_scale = float(tiling_config.get("scale", 1.0))
+
+    # Create nodes
+    out_node = nodes.new(type="ShaderNodeOutputMaterial")
+    out_node.location = (400, 0)
+
+    bsdf_node = nodes.new(type="ShaderNodeBsdfPrincipled")
+    bsdf_node.location = (100, 0)
+
+    image_node = nodes.new(type="ShaderNodeTexImage")
+    image_node.location = (-200, 0)
+
+    # Mapping node for UV scaling/tiling
+    mapping_node = nodes.new(type="ShaderNodeMapping")
+    mapping_node.location = (-400, 0)
+
+    texcoord_node = nodes.new(type="ShaderNodeTexCoord")
+    texcoord_node.location = (-600, 0)
+
+    # Load the image texture
+    image_node.image = bpy.data.images.load(str(texture_path))
+
+    # Configure tiling based on config
+    if tiling_enabled:
+        # REPEAT allows texture to tile seamlessly
+        image_node.extension = "REPEAT"
+        # Scale determines how many times texture repeats across floor
+        mapping_node.inputs["Scale"].default_value = (tiling_scale, tiling_scale, 1.0)
+        logger.info(f"Floor texture tiling enabled: scale={tiling_scale}")
+    else:
+        # EXTEND stretches texture across floor without tiling
+        image_node.extension = "EXTEND"
+        mapping_node.inputs["Scale"].default_value = (1.0, 1.0, 1.0)
+
+    # Connect nodes: TexCoord -> Mapping -> ImageTexture -> BSDF
+    # Using "Generated" coordinates which are normalized to [0,1] over bounding box
+    links.new(texcoord_node.outputs["Generated"], mapping_node.inputs["Vector"])
+    links.new(mapping_node.outputs["Vector"], image_node.inputs["Vector"])
+    links.new(image_node.outputs["Color"], bsdf_node.inputs["Base Color"])
+    links.new(bsdf_node.outputs["BSDF"], out_node.inputs["Surface"])
+
+    # Material properties - keep the floor fairly matte
+    bsdf_node.inputs["Roughness"].default_value = 0.9
+    # Blender 4.0+ uses "Specular IOR Level", older versions use "Specular"
+    specular_input = bsdf_node.inputs.get("Specular IOR Level") or bsdf_node.inputs.get("Specular")
+    if specular_input:
+        specular_input.default_value = 0.2
+
+    # Assign material to the Blender object's mesh data
+    # NOTE: We must replace the material in data.materials, not just set active_material
+    # Kubric already assigned a PrincipledBSDFMaterial, so we need to overwrite it
+    if blender_obj.data.materials:
+        blender_obj.data.materials[0] = mat
+    else:
+        blender_obj.data.materials.append(mat)
+    logger.info(f"Applied floor texture: {texture_path}")
 
 
 def create_walls(scene: "kb.Scene", config: dict) -> None:
@@ -541,17 +706,80 @@ def create_walls(scene: "kb.Scene", config: dict) -> None:
     logger.info("Created arena walls")
 
 
+def sample_initial_cube_position_xy(config: dict, cube_size: float) -> tuple[float, float]:
+    """Sample a random initial (x, y) position for the cube near the arena center.
+
+    Supports either explicit ranges:
+      object.initial_position.x_range, object.initial_position.y_range
+    or a fraction of the arena size:
+      object.initial_position.xy_fraction_of_arena
+
+    The sampled position is clamped to stay inside the arena bounds.
+    """
+    walls_cfg = config.get("walls", {}) or {}
+    arena_size = float(walls_cfg.get("arena_size", 2.5))
+    walls_enabled = bool(walls_cfg.get("enabled", False))
+    wall_thickness = float(walls_cfg.get("thickness", 0.0)) if walls_enabled else 0.0
+
+    # Keep cube fully inside arena even with walls present
+    max_abs_xy = arena_size / 2.0 - wall_thickness - cube_size / 2.0
+    if max_abs_xy <= 0:
+        return 0.0, 0.0
+
+    obj_cfg = config.get("object", {}) or {}
+    init_cfg = obj_cfg.get("initial_position", {}) or {}
+
+    x_low = x_high = y_low = y_high = None
+
+    if "x_range" in init_cfg and "y_range" in init_cfg:
+        try:
+            x_low, x_high = map(float, init_cfg["x_range"])
+            y_low, y_high = map(float, init_cfg["y_range"])
+        except Exception:
+            logger.warning("Invalid object.initial_position x_range/y_range; falling back to defaults")
+            x_low = x_high = y_low = y_high = None
+    elif "xy_fraction_of_arena" in init_cfg:
+        frac = float(init_cfg["xy_fraction_of_arena"])
+        spawn_range = arena_size * frac
+        x_low, x_high = -spawn_range, spawn_range
+        y_low, y_high = -spawn_range, spawn_range
+
+    if x_low is None:
+        # Backwards-compatible default: central 30% of arena (range = 0.15 * arena_size)
+        spawn_range = arena_size * 0.15
+        x_low, x_high = -spawn_range, spawn_range
+        y_low, y_high = -spawn_range, spawn_range
+
+    if x_low > x_high:
+        x_low, x_high = x_high, x_low
+    if y_low > y_high:
+        y_low, y_high = y_high, y_low
+
+    # Clamp configured ranges to physical arena bounds
+    x_low = max(x_low, -max_abs_xy)
+    x_high = min(x_high, max_abs_xy)
+    y_low = max(y_low, -max_abs_xy)
+    y_high = min(y_high, max_abs_xy)
+
+    if x_low > x_high or y_low > y_high:
+        logger.warning(
+            "Configured initial position range is outside arena bounds; using full allowed range"
+        )
+        x_low, x_high = -max_abs_xy, max_abs_xy
+        y_low, y_high = -max_abs_xy, max_abs_xy
+
+    start_x = float(np.random.uniform(x_low, x_high))
+    start_y = float(np.random.uniform(y_low, y_high))
+    return start_x, start_y
+
+
 def create_dynamic_cube(scene: "kb.Scene", config: dict, parameters: dict) -> "kb.Cube":
     """Create the dynamic cube object."""
     size = parameters["object_size"]
     color = parameters["object_color_rgba"]
 
-    # Random starting position (centered, exactly resting on floor)
-    # Use a smaller spawn area relative to the arena size
-    arena_size = config["walls"].get("arena_size", 2.5)
-    spawn_range = arena_size * 0.15  # Spawn in central 30% of arena
-    start_x = np.random.uniform(-spawn_range, spawn_range)
-    start_y = np.random.uniform(-spawn_range, spawn_range)
+    # Random starting position (near center, exactly resting on floor)
+    start_x, start_y = sample_initial_cube_position_xy(config, cube_size=size)
     start_z = size / 2  # Exactly resting on floor (no gap = no settling)
 
     cube = kb.Cube(
@@ -930,9 +1158,10 @@ def generate_clip_dry_run(
     parameters = sample_physics_parameters(config, friction_category, mass_mode, phase)
 
     # Add placeholder initial position
+    start_x, start_y = sample_initial_cube_position_xy(config, cube_size=parameters["object_size"])
     parameters["initial_position"] = {
-        "x": float(np.random.uniform(-0.5, 0.5)),
-        "y": float(np.random.uniform(-0.5, 0.5)),
+        "x": float(start_x),
+        "y": float(start_y),
         "z": float(parameters["object_size"] / 2 + 0.01)
     }
 
@@ -1014,7 +1243,7 @@ def generate_clip(
     setup_environment(scene, config)
 
     # Create floor and walls
-    create_checkerboard_floor(scene, config, parameters)
+    floor = create_floor(scene, config, parameters)
     create_walls(scene, config)
 
     # Create dynamic object
@@ -1030,6 +1259,9 @@ def generate_clip(
         use_denoising=True,
         samples_per_pixel=64,
     )
+
+    # Apply the floor texture (rendering only).
+    apply_floor_texture_material(renderer, floor, config)
 
     # Setup simulator
     simulator = KubricSimulator(scene)
