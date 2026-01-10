@@ -48,7 +48,7 @@ cd /path/to/masterthesis_data_generation
 
 # Ensure the floor texture exists (committed as generate_grid_image/black_grid.png).
 # If you regenerated/removed it, recreate it once:
-python3 generate_grid_image/generate_black_grid_png.py
+uv run python3 generate_grid_image/generate_black_grid_png.py
 
 # Start Docker container with GPU and increased shared memory for parallel workers
 docker run --rm -it \
