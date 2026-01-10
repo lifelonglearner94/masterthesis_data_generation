@@ -138,6 +138,29 @@ def check_gpu_available() -> bool:
         return False
 
 
+def get_gpu_count() -> int:
+    """
+    Get the number of available NVIDIA GPUs.
+
+    Returns:
+        Number of GPUs detected, or 0 if none available
+    """
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            # Count non-empty lines
+            lines = [line.strip() for line in result.stdout.strip().split("\n") if line.strip()]
+            return len(lines)
+        return 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return 0
+
+
 def get_gpu_vram_usage() -> Tuple[float, float, float]:
     """
     Query GPU VRAM usage via nvidia-smi.

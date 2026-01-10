@@ -84,6 +84,83 @@ except ImportError:
     KUBRIC_AVAILABLE = False
     print("WARNING: Kubric not available. Running in dry-run mode.")
 
+
+def force_gpu_rendering(use_optix: bool = True) -> bool:
+    """
+    Force Blender Cycles to use GPU rendering and disable CPU fallback.
+
+    This function explicitly configures Blender to use OPTIX (preferred for RTX cards)
+    or CUDA as the compute device, and disables CPU rendering to prevent the
+    "tile stealing" problem where the GPU waits for slower CPU tiles.
+
+    Must be called AFTER the KubricRenderer is initialized but BEFORE rendering.
+
+    Args:
+        use_optix: If True, prefer OptiX (faster on RTX cards with RT cores).
+                   Falls back to CUDA if OptiX is unavailable.
+
+    Returns:
+        True if GPU was successfully configured, False otherwise.
+    """
+    if not KUBRIC_AVAILABLE:
+        return False
+
+    try:
+        from kubric.safeimport.bpy import bpy
+    except Exception as exc:
+        logger.warning(f"Cannot import bpy for GPU configuration: {exc}")
+        return False
+
+    try:
+        scene = bpy.context.scene
+        scene.cycles.device = 'GPU'
+
+        prefs = bpy.context.preferences
+        cprefs = prefs.addons['cycles'].preferences
+
+        # Refresh devices to ensure hardware is detected
+        cprefs.get_devices()
+
+        # Select compute device type: OPTIX preferred, fallback to CUDA
+        target_type = 'OPTIX' if use_optix else 'CUDA'
+
+        try:
+            cprefs.compute_device_type = target_type
+            logger.info(f"Set Blender compute device type: {target_type}")
+        except TypeError:
+            logger.warning(f"{target_type} not available, falling back to CUDA")
+            try:
+                cprefs.compute_device_type = 'CUDA'
+                target_type = 'CUDA'
+            except TypeError:
+                logger.warning("CUDA not available either, GPU rendering disabled")
+                return False
+
+        # Explicitly enable GPU devices and disable CPU
+        available_devices = cprefs.devices
+        gpu_active = False
+
+        for device in available_devices:
+            if device.type in {'CUDA', 'OPTIX'}:
+                device.use = True
+                logger.info(f"GPU device enabled: {device.name} ({device.type})")
+                gpu_active = True
+            else:
+                # Disable CPU to prevent tile-stealing bottleneck
+                device.use = False
+                logger.debug(f"CPU device disabled: {device.name}")
+
+        if not gpu_active:
+            logger.warning("No GPU devices found in Blender. Rendering will use CPU.")
+            return False
+
+        logger.info("GPU rendering configured successfully")
+        return True
+
+    except Exception as exc:
+        logger.warning(f"Failed to configure GPU rendering: {exc}")
+        return False
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -1168,6 +1245,14 @@ def generate_clip(
         use_denoising=True,
         samples_per_pixel=64,
     )
+
+    # Force GPU rendering with OptiX/CUDA (disable CPU fallback)
+    # This must be called AFTER renderer initialization but BEFORE rendering
+    gpu_configured = force_gpu_rendering(use_optix=True)
+    if gpu_configured:
+        logger.info("GPU rendering enabled (OptiX/CUDA)")
+    else:
+        logger.warning("GPU rendering not available, falling back to CPU")
 
     # Apply the floor texture (rendering only).
     apply_floor_texture_material(renderer, floor, config)

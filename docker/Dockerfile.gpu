@@ -1,0 +1,54 @@
+# Dockerfile.gpu - Optimized Docker image for Kubric GPU rendering
+#
+# This Dockerfile extends the official kubruntu image with:
+# - Pre-installed dependencies (avoids first-run delays)
+# - NVIDIA runtime environment variables for GPU access
+# - OptiX/CUDA rendering support
+#
+# Build:
+#   docker build -f docker/Dockerfile.gpu -t kubric-gpu:latest .
+#
+# Run:
+#   docker run --rm -it \
+#       --gpus all \
+#       --shm-size=8g \
+#       -v "$(pwd):/workspace" \
+#       -w /workspace \
+#       kubric-gpu:latest \
+#       python experiments/scripts/manager_benchmark.py --help
+
+FROM kubricdockerhub/kubruntu:latest
+
+# NVIDIA Container Runtime environment variables
+# These are REQUIRED for GPU access inside the container
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+
+# Pre-install runtime dependencies to avoid first-run delays
+# This eliminates the need for apt-get/pip during generation
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        python3-yaml \
+        python3-numpy \
+        python3-pil \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set optimal Blender environment defaults
+# These can be overridden at runtime if needed
+ENV BLENDER_CPU_THREADS=1
+ENV OMP_NUM_THREADS=1
+ENV OPENBLAS_NUM_THREADS=1
+ENV MKL_NUM_THREADS=1
+
+# Ensure Python output is not buffered (for real-time logging)
+ENV PYTHONUNBUFFERED=1
+
+# Default working directory
+WORKDIR /workspace
+
+# Healthcheck to verify GPU is accessible
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD nvidia-smi > /dev/null 2>&1 || exit 1
+
+# Default command shows usage
+CMD ["python", "experiments/scripts/manager_benchmark.py", "--help"]

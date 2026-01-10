@@ -109,7 +109,7 @@ python -c "import glob, numpy as np; p = sorted(glob.glob('experiments/output/te
 
 ---
 
-## �� Option B: Full Production (17,000 Clips)
+## 📈 Option B: Full Production (17,000 Clips)
 
 Generate the complete A-B-A dataset:
 - **Phase A₁** (clips 0–14,999): Normal friction, random mass
@@ -126,14 +126,24 @@ cd /path/to/masterthesis_data_generation
 # If you regenerated/removed it, recreate it once:
 python3 generate_grid_image/generate_black_grid_png.py
 
-# Start Docker container with GPU and increased shared memory for parallel workers
-# NOTE: --shm-size=8g is REQUIRED for parallel execution
+# OLD OLD OLD OLD///Option A: Use the official Kubric image (quick start)///
 docker run --rm -it \
     --gpus all \
     --shm-size=8g \
     -v "$(pwd):/workspace" \
     -w /workspace \
     kubricdockerhub/kubruntu:latest \
+    /bin/bash
+
+# Option B: Build and use the optimized GPU image (recommended for production)
+# This pre-installs dependencies and sets optimal GPU environment variables
+docker build -f docker/Dockerfile.gpu -t kubric-gpu:latest .
+docker run --rm -it \
+    --gpus all \
+    --shm-size=8g \
+    -v "$(pwd):/workspace" \
+    -w /workspace \
+    kubric-gpu:latest \
     /bin/bash
 ```
 
@@ -180,7 +190,63 @@ uv run experiments/scripts/encode_benchmark_vjepa2.py \
 
 ---
 
-## 📊 Output Structure
+## � Performance Optimizations
+
+The pipeline includes several optimizations for high-throughput rendering:
+
+### GPU Rendering (Automatic)
+
+The worker automatically configures Blender Cycles to use **OptiX** (RTX cards) or **CUDA** for GPU-accelerated rendering, and explicitly disables CPU fallback to prevent the "tile-stealing" bottleneck where the GPU waits for slower CPU tiles.
+
+### Multi-GPU Support
+
+For systems with multiple GPUs, use `--multi_gpu` to distribute workers across all available GPUs in round-robin fashion:
+
+```bash
+python experiments/scripts/manager_benchmark.py \
+    --seed 42 \
+    --output_dir experiments/output/friction_dataset_v1 \
+    --workers 8 \
+    --multi_gpu \
+    --auto_scale \
+    --no_gif
+```
+
+This sets `CUDA_VISIBLE_DEVICES` per worker, allowing true parallel GPU utilization.
+
+### Optimized Docker Image
+
+Build the optimized GPU image for faster startup and better GPU integration:
+
+```bash
+docker build -f docker/Dockerfile.gpu -t kubric-gpu:latest .
+```
+
+Benefits:
+- Pre-installed dependencies (no first-run apt/pip delays)
+- NVIDIA runtime environment variables for GPU access
+- Optimal thread configuration for parallel workers
+
+### RAM-backed Scratch Directory (Advanced)
+
+For maximum I/O performance, mount a tmpfs for Blender's scratch files:
+
+```bash
+docker run --rm -it \
+    --gpus all \
+    --shm-size=8g \
+    --tmpfs /workspace/experiments/output:rw,size=16g \
+    -v "$(pwd):/workspace" \
+    -w /workspace \
+    kubric-gpu:latest \
+    /bin/bash
+```
+
+> ⚠️ **Warning**: Output will be lost on container exit! Copy results before exiting.
+
+---
+
+## �📊 Output Structure
 
 Each generated clip has this structure:
 
@@ -237,6 +303,7 @@ Edit `experiments/config/physics_config.yaml` to customize physics parameters:
 | `--auto_scale` | VRAM-aware throttling: pause submission when GPU memory is high |
 | `--force_restart` | Ignore existing completed clips and regenerate all (disables auto-resume) |
 | `--no_gif` | Skip GIF preview generation (recommended for production) |
+| `--multi_gpu` | Distribute workers across all available GPUs (round-robin) |
 
 ### encode_benchmark_vjepa2.py (Encoding)
 

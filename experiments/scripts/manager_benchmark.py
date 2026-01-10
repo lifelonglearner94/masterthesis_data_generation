@@ -36,6 +36,7 @@ from experiments.scripts.utils import (
     EXIT_GENERAL_ERROR,
     EXIT_VRAM_ERROR,
     check_gpu_available,
+    get_gpu_count,
     get_gpu_vram_usage,
     load_physics_config,
     get_total_clips_from_config,
@@ -127,12 +128,20 @@ def find_completed_jobs(output_dir: Path, job_ids: List[int]) -> set:
     return completed
 
 
-def build_worker_environment() -> dict:
+def build_worker_environment(gpu_id: int = None) -> dict:
     """
     Build environment dict for worker subprocesses with thread limiting.
 
     Forces NumPy/OpenBLAS/MKL to use single-threaded mode to prevent
     resource contention when running multiple workers.
+
+    Args:
+        gpu_id: If specified, sets CUDA_VISIBLE_DEVICES to this GPU index.
+                This enables multi-GPU distribution by isolating each worker
+                to a specific GPU.
+
+    Returns:
+        Environment dictionary for subprocess execution
     """
     env = os.environ.copy()
 
@@ -146,6 +155,10 @@ def build_worker_environment() -> dict:
 
     # Limit Blender's internal threading
     env["BLENDER_CPU_THREADS"] = "1"
+
+    # Multi-GPU support: isolate worker to specific GPU
+    if gpu_id is not None:
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
     return env
 
@@ -185,6 +198,7 @@ def run_single_job(
     timeout: int = 600,  # 10 minute timeout per job
     worker_env: Optional[dict] = None,
     no_gif: bool = False,
+    gpu_id: Optional[int] = None,
 ) -> JobResult:
     """
     Execute a single worker script as a subprocess.
@@ -199,6 +213,7 @@ def run_single_job(
         timeout: Maximum time to wait for job completion
         worker_env: Environment dict for subprocess (with thread limits)
         no_gif: If True, skip GIF preview generation
+        gpu_id: If specified, run worker on this specific GPU (multi-GPU support)
 
     Returns:
         JobResult with execution details
@@ -222,8 +237,11 @@ def run_single_job(
     if no_gif:
         cmd.append("--no_gif")
 
-    # Use thread-limited environment if provided
-    env = worker_env if worker_env is not None else build_worker_environment()
+    # Use thread-limited environment if provided, with optional GPU assignment
+    if worker_env is not None:
+        env = worker_env
+    else:
+        env = build_worker_environment(gpu_id=gpu_id)
 
     start_time = time.perf_counter()
 
@@ -289,16 +307,20 @@ def run_single_job_with_retry(
     worker_env: Optional[dict] = None,
     max_retries: int = 1,
     no_gif: bool = False,
+    gpu_id: Optional[int] = None,
 ) -> JobResult:
     """
     Execute a job with retry logic for VRAM errors.
 
     VRAM errors (exit code 2) are retried once after a cooldown period.
     Other errors fail immediately.
+
+    Args:
+        gpu_id: If specified, run worker on this specific GPU (multi-GPU support)
     """
     result = run_single_job(
         worker_script, output_dir, job_id, seed, physics_config,
-        dry_run, timeout, worker_env, no_gif
+        dry_run, timeout, worker_env, no_gif, gpu_id
     )
 
     if result.success:
@@ -310,7 +332,7 @@ def run_single_job_with_retry(
         time.sleep(VRAM_RETRY_DELAY)
         return run_single_job_with_retry(
             worker_script, output_dir, job_id, seed, physics_config,
-            dry_run, timeout, worker_env, max_retries - 1, no_gif
+            dry_run, timeout, worker_env, max_retries - 1, no_gif, gpu_id
         )
 
     return result
@@ -515,6 +537,7 @@ def run_production(
     auto_scale: bool = False,
     force_restart: bool = False,
     no_gif: bool = False,
+    multi_gpu: bool = False,
 ) -> None:
     """
     Run the full production dataset generation with pipeline saturation.
@@ -526,6 +549,9 @@ def run_production(
     RESUME SUPPORT: Automatically detects and skips already-completed jobs
     by checking for the existence of ground_truth.json in each clip directory.
     This allows the pipeline to resume from where it left off after interruption.
+
+    MULTI-GPU SUPPORT: When multi_gpu=True, workers are distributed across
+    available GPUs in round-robin fashion using CUDA_VISIBLE_DEVICES.
 
     Args:
         worker_script: Path to worker script
@@ -539,10 +565,22 @@ def run_production(
         auto_scale: If True, pause submission when VRAM is high
         force_restart: If True, ignore existing completed jobs and regenerate all
         no_gif: If True, skip GIF preview generation (faster for production)
+        multi_gpu: If True, distribute workers across multiple GPUs
     """
     total_jobs_requested = end_job - start_job + 1
     logger.info(f"Production run requested: jobs {start_job} to {end_job} ({total_jobs_requested:,} total)")
     logger.info(f"Parallel workers: {max_workers} (auto_scale={auto_scale})")
+
+    # Multi-GPU setup
+    num_gpus = get_gpu_count() if multi_gpu else 1
+    if multi_gpu:
+        if num_gpus > 1:
+            logger.info(f"Multi-GPU mode enabled: distributing workers across {num_gpus} GPUs")
+        elif num_gpus == 1:
+            logger.warning("Multi-GPU requested but only 1 GPU found. Running on single GPU.")
+        else:
+            logger.warning("Multi-GPU requested but no GPUs found. Workers will use CPU.")
+            num_gpus = 1  # Avoid division by zero
 
     # Build full job list
     all_job_ids = list(range(start_job, end_job + 1))
@@ -594,8 +632,19 @@ def run_production(
     else:
         logger.info(f"Metadata already exists at {metadata_path}, preserving original")
 
-    # Build thread-limited environment once
-    worker_env = build_worker_environment()
+    # Build thread-limited environment once (without GPU assignment - will be per-job for multi-GPU)
+    worker_env = build_worker_environment() if not multi_gpu else None
+
+    # GPU slot counter for round-robin distribution
+    gpu_slot_counter = [0]  # Mutable container for closure
+
+    def get_next_gpu_id() -> Optional[int]:
+        """Get the next GPU ID for round-robin distribution."""
+        if not multi_gpu or num_gpus <= 1:
+            return None
+        gpu_id = gpu_slot_counter[0] % num_gpus
+        gpu_slot_counter[0] += 1
+        return gpu_id
 
     # Note: job_ids is already filtered above for resume support
 
@@ -684,6 +733,8 @@ def run_production(
         # Use ThreadPoolExecutor to manage subprocess workers
         # This allows VRAM monitoring between submissions
         logger.info(f"Using parallel execution with {max_workers} workers")
+        if multi_gpu and num_gpus > 1:
+            logger.info(f"Multi-GPU: distributing jobs across GPUs 0-{num_gpus-1}")
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {}
@@ -700,6 +751,9 @@ def run_production(
                     if auto_scale:
                         wait_for_vram_available()
 
+                    # Get GPU assignment for this job (round-robin for multi-GPU)
+                    gpu_id = get_next_gpu_id()
+
                     future = executor.submit(
                         run_single_job_with_retry,
                         worker_script,
@@ -712,6 +766,7 @@ def run_production(
                         worker_env,
                         1,  # max_retries
                         no_gif,
+                        gpu_id,
                     )
                     futures[future] = job_id
                     pending_count += 1
@@ -754,6 +809,9 @@ def run_production(
                             if auto_scale:
                                 wait_for_vram_available()
 
+                            # Get GPU assignment for this job (round-robin for multi-GPU)
+                            gpu_id = get_next_gpu_id()
+
                             new_future = executor.submit(
                                 run_single_job_with_retry,
                                 worker_script,
@@ -766,6 +824,7 @@ def run_production(
                                 worker_env,
                                 1,  # max_retries
                                 no_gif,
+                                gpu_id,
                             )
                             futures[new_future] = next_job_id
                             pending_count += 1
@@ -775,6 +834,7 @@ def run_production(
         # Sequential execution (standard for single GPU)
         logger.info("Using sequential execution (single worker)")
         for job_id in job_ids:
+            gpu_id = get_next_gpu_id() if multi_gpu else None
             result = run_single_job_with_retry(
                 worker_script=worker_script,
                 output_dir=output_dir,
@@ -784,6 +844,7 @@ def run_production(
                 dry_run=dry_run,
                 worker_env=worker_env,
                 no_gif=no_gif,
+                gpu_id=gpu_id,
             )
             process_result(result)
 
@@ -969,6 +1030,13 @@ Examples:
         help="Skip GIF preview generation (recommended for production runs)"
     )
 
+    parser.add_argument(
+        "--multi_gpu",
+        action="store_true",
+        help="Enable multi-GPU mode: distribute workers across all available GPUs in round-robin fashion"
+    )
+    )
+
     args = parser.parse_args()
 
     # Set default workers if not specified
@@ -1087,6 +1155,7 @@ Examples:
             auto_scale=args.auto_scale,
             force_restart=args.force_restart,
             no_gif=args.no_gif,
+            multi_gpu=args.multi_gpu,
         )
 
 
