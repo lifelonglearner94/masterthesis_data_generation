@@ -53,8 +53,8 @@ friction:
     max: 0.9
   # Slippery / OOD distribution (for Phase B)
   slippery:
-    min: 0.49
-    max: 0.51
+    min: 0.29
+    max: 0.33
 
 
 # Force impulse settings
