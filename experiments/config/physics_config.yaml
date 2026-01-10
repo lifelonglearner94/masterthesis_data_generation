@@ -30,7 +30,7 @@ environment:
 object:
   type: "cube"
   size_range: [0.5, 0.8]  # Random size between these values
-  mass_range: [0.5, 2.0]  # kg (used in Phase A_1)
+  mass_range: [1, 1]  # kg (used in Phase A_1)
   mass_fixed: 1.0         # kg (used in Phase B and A_2)
   # Initial position of the cube (XY is centered around (0, 0))
   #
@@ -49,19 +49,19 @@ object:
 friction:
   # Normal distribution (for Phase A_1 and A_2)
   normal:
-    min: 0.6
+    min: 0.75
     max: 0.9
   # Slippery / OOD distribution (for Phase B)
   slippery:
-    min: 0.09
-    max: 0.15
+    min: 0.49
+    max: 0.51
 
 
 # Force impulse settings
 force:
   # Magnitude range (Newtons) - tuned for ~1 second of visible motion
   magnitude_min: 3.0
-  magnitude_max: 4.5
+  magnitude_max: 4.0
   # Direction constraints (applied on XY plane only - 2D force)
   apply_at_frame: 1  # Apply force between frame 1 and 2
 

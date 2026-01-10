@@ -853,7 +853,7 @@ def apply_force_impulse_during_simulation(
 
     logger.info(f"Simulation complete. Recorded {frame_end - frame_start + 1} keyframes.")
 
-    # Extract cube positions (x, y) for each frame for states.npy
+    # Extract cube positions (x, y) for each frame for ground_truth_states.npy
     cube_positions = animation[cube]["position"]  # List of (x, y, z) tuples
     cube_positions_xy = np.array([[pos[0], pos[1]] for pos in cube_positions])  # Shape: (T, 2)
 
@@ -867,7 +867,7 @@ def save_states_and_actions(
     config: dict
 ) -> None:
     """
-    Save states.npy and actions.npy for this clip.
+    Save ground_truth_states.npy and actions.npy for this clip.
 
     Args:
         actions_states_dir: Path to the actions_states directory
@@ -888,10 +888,10 @@ def save_states_and_actions(
     actions[apply_frame, 1] = force_vector["y"]
 
     # Save arrays
-    np.save(actions_states_dir / "states.npy", states.astype(np.float32))
+    np.save(actions_states_dir / "ground_truth_states.npy", states.astype(np.float32))
     np.save(actions_states_dir / "actions.npy", actions)
 
-    logger.info(f"Saved states.npy {states.shape} and actions.npy {actions.shape} to {actions_states_dir}")
+    logger.info(f"Saved ground_truth_states.npy {states.shape} and actions.npy {actions.shape} to {actions_states_dir}")
 
 
 def setup_output_directories(output_dir: Path) -> dict:
