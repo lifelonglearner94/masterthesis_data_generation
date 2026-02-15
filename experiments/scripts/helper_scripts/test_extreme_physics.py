@@ -102,8 +102,8 @@ def sample_extreme_physics_parameters(config: dict) -> dict:
     # Use maximum force
     force_magnitude = config["force"]["magnitude_max"]
 
-    # Fixed mass for consistent comparison
-    object_mass = config["object"].get("mass_fixed", 1.0)
+    # Use OOD mass for extreme test (testing slippery conditions)
+    object_mass = config["object"].get("mass_ood", 1.2)
 
     # Random object size (keep this random for variety)
     obj_config = config["object"]
@@ -127,7 +127,7 @@ def sample_extreme_physics_parameters(config: dict) -> dict:
         "phase": "EXTREME_TEST",
         "friction_coefficient": float(friction_coefficient),
         "friction_category": "slippery",
-        "mass_mode": "fixed",
+        "mass_mode": "ood",
         "object_size": float(object_size),
         "object_mass": float(object_mass),
         "force_vector": {

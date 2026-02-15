@@ -5,7 +5,7 @@
 # Video specifications
 video:
   resolution: 256
-  num_frames: 32
+  num_frames: 16
   fps: 30             # Output video frame rate (previously it was 20)
   simulation_fps: 240  # Internal simulation rate
 
@@ -26,12 +26,17 @@ environment:
   ambient_light: 0.3
   key_light_intensity: 1.0
 
-# Dynamic object (cube)
+# Dynamic object
 object:
-  type: "cube"
-  size_range: [0.5, 0.8]  # Random size between these values
-  mass_range: [1, 1]  # kg (used in Phase A_1)
-  mass_fixed: 1.0         # kg (used in Phase B and A_2)
+  # Available object types from KuBasic asset source:
+  # Primitives: cube, cylinder, cone, sphere, torus
+  # Complex shapes: suzanne (Blender monkey), teapot (Utah teapot), gear, spot (quadruped)
+  # Additional: torus_knot, sponge
+  # Note: 'cube' and 'sphere' use native Kubric primitives; others use KuBasic assets
+  types: ["cube", "cylinder", "cone", "torus", "suzanne", "teapot", "gear", "spot"]
+  size_range: [1.1, 1.5]  # Random size between these values
+  mass_normal: 2.5        # kg (used in Phase A_1 and A_2 - normal/in-distribution)
+  mass_ood: 1.1           # kg (used in Phase B - out-of-distribution)
   # Initial position of the cube (XY is centered around (0, 0))
   #
   # Notes:
@@ -49,19 +54,19 @@ object:
 friction:
   # Normal distribution (for Phase A_1 and A_2)
   normal:
-    min: 0.75
-    max: 0.9
+    min: 0.99
+    max: 0.99
   # Slippery / OOD distribution (for Phase B)
   slippery:
-    min: 0.29
-    max: 0.33
+    min: 0.00
+    max: 0.00
 
 
 # Force impulse settings
 force:
   # Magnitude range (Newtons) - tuned for ~1 second of visible motion
-  magnitude_min: 3.0
-  magnitude_max: 4.0
+  magnitude_min: 12
+  magnitude_max: 13
   # Direction constraints (applied on XY plane only - 2D force)
   apply_at_frame: 1  # Apply force between frame 1 and 2
 
@@ -73,20 +78,20 @@ force:
 dataset:
   # Phase definitions
   phase_a1:
-    clips: 15000
-    range: [0, 14999]
-    mass_mode: "random"      # Use mass_range
+    clips: 5000
+    range: [17000, 21999]
+    mass_mode: "normal"      # Use mass_normal
     friction_mode: "normal"
   phase_b:
     clips: 1000
-    range: [15000, 15999]
-    mass_mode: "fixed"       # Use mass_fixed
+    range: [22000, 22999]
+    mass_mode: "ood"          # Use mass_ood
     friction_mode: "slippery"
   phase_a2:
     clips: 1000
-    range: [16000, 16999]
-    mass_mode: "fixed"       # Use mass_fixed
+    range: [23000, 23999]
+    mass_mode: "normal"      # Use mass_normal
     friction_mode: "normal"
 
   # Total clips
-  total_clips: 17000
+  total_clips: 7000

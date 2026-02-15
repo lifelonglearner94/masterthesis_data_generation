@@ -5,7 +5,7 @@ Usage:
     python experiments/scripts/print_npy.py file.npy [other.npy ...]
 
 Options:
-    -s, --summary   Print a short summary (shape, dtype, basic stats for numeric arrays)
+    -s, --summary   Print a short summary (shape, dtype, basic stats, histogram)
     -d, --diff      Print per-row diffs compared to the previous row
     -l, --limit N   If provided, print at most N elements from each array
 """
@@ -16,17 +16,63 @@ import sys
 import numpy as np
 
 
+def draw_histogram(arr: np.ndarray, bins: int = 40) -> str:
+    """Creates a single-line ASCII histogram."""
+    try:
+        # Use float64 for histogram calculation to avoid overflow
+        counts, _ = np.histogram(arr.astype(np.float64), bins=bins)
+        
+        # Normalize counts to pick characters
+        # Blocks:  , ▂, ▃, ▄, ▅, ▆, ▇, █
+        chars = "  ▂▃▄▅▆▇█"
+        max_count = counts.max()
+        if max_count == 0:
+            return ""
+            
+        result = []
+        for c in counts:
+            # Map count to 0-7 index
+            idx = int((c / max_count) * (len(chars) - 1))
+            result.append(chars[idx])
+        return "".join(result)
+    except Exception:
+        return ""
+
+
 def print_array(path: Path, arr: np.ndarray, args: argparse.Namespace) -> None:
     print(f"--- {path} ---")
+    
     if args.summary:
         shape = getattr(arr, "shape", None)
         dtype = getattr(arr, "dtype", None)
         print(f"shape: {shape}, dtype: {dtype}")
+        
         try:
             if np.issubdtype(arr.dtype, np.number):
-                print(f"min: {arr.min()}, max: {arr.max()}, mean: {float(arr.mean())}")
-        except Exception:
-            pass
+                # FIX: Cast to float64 for stats to avoid float16 overflow (inf)
+                stats = arr.astype(np.float64)
+                
+                # Basic Stats
+                mn = stats.min()
+                mx = stats.max()
+                mean = stats.mean()
+                std = stats.std()
+                
+                # Percentiles for better "sense" of deviation
+                p25, p50, p75 = np.percentile(stats, [25, 50, 75])
+
+                print(f"min: {mn:.4g}, max: {mx:.4g}")
+                print(f"mean: {mean:.4g}, std: {std:.4g}")
+                print(f"qtiles: 25%: {p25:.4g} | 50%: {p50:.4g} (med) | 75%: {p75:.4g}")
+                
+                # Visual Sense of Deviation
+                if stats.size > 1:
+                    hist = draw_histogram(arr)
+                    print(f"dist: |{hist}|")
+                    
+        except Exception as e:
+            # Helpful debugging if stats fail (e.g. on complex numbers)
+            print(f"(stats unavailable: {e})")
 
     def _fmt(x):
         try:

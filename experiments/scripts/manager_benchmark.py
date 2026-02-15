@@ -1035,7 +1035,7 @@ Examples:
         action="store_true",
         help="Enable multi-GPU mode: distribute workers across all available GPUs in round-robin fashion"
     )
-    )
+    
 
     args = parser.parse_args()
 

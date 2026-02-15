@@ -9,11 +9,18 @@ This script:
 - Iterates over `clip_*/rgb/frame_*.png`.
 - Encodes each clip into patch features and saves one .npy file per clip.
 - Uses all visible GPUs via `torch.nn.DataParallel` (requires batch_size > 1).
+- Supports Apple Silicon (M1/M2/M3) via MPS (Metal Performance Shaders).
 - Tracks wall-clock time and reports throughput.
 
 Example:
   python experiments/scripts/encode_benchmark_vjepa2.py \
     --data_dir experiments/output/benchmark_test \
+    --batch_size 4
+
+Mac M1/M2/M3 example:
+  python experiments/scripts/encode_benchmark_vjepa2.py \
+    --data_dir experiments/output/test_6clips \
+    --in_place \
     --batch_size 4
 """
 
@@ -72,6 +79,25 @@ def _ensure_light_dependencies() -> None:
 _ensure_light_dependencies()
 
 import numpy as np
+import platform
+
+
+def _get_platform_info() -> dict:
+    """Detect platform and available accelerators."""
+    info = {
+        "system": platform.system(),
+        "machine": platform.machine(),
+        "is_apple_silicon": False,
+        "has_mps": False,
+        "has_cuda": False,
+        "cuda_count": 0,
+    }
+    
+    # Detect Apple Silicon
+    if info["system"] == "Darwin" and info["machine"] == "arm64":
+        info["is_apple_silicon"] = True
+    
+    return info
 
 
 def _require_imports() -> Tuple["torch", "Image"]:
@@ -79,8 +105,9 @@ def _require_imports() -> Tuple["torch", "Image"]:
         import torch  # type: ignore
     except Exception as e:  # pragma: no cover
         raise RuntimeError(
-            "Missing dependency 'torch'. Install PyTorch with CUDA for GPU encoding. "
-            "See https://pytorch.org/get-started/locally/"
+            "Missing dependency 'torch'. Install PyTorch for encoding. "
+            "For Apple Silicon: pip install torch torchvision. "
+            "For CUDA: See https://pytorch.org/get-started/locally/"
         ) from e
 
     try:
@@ -170,7 +197,53 @@ _ENCODER_CACHE = {
     "device": None,
     "torch": None,
     "Image": None,
+    "platform_info": None,
 }
+
+
+def _select_best_device(torch, allow_cpu: bool = True) -> Tuple["torch.device", dict]:
+    """
+    Select the best available compute device.
+    
+    Priority: CUDA > MPS (Apple Silicon) > CPU
+    
+    Returns:
+        Tuple of (device, platform_info_dict)
+    """
+    platform_info = _get_platform_info()
+    
+    # Check CUDA first (highest priority for multi-GPU support)
+    cuda_count = torch.cuda.device_count()
+    platform_info["cuda_count"] = cuda_count
+    platform_info["has_cuda"] = cuda_count > 0
+    
+    if cuda_count > 0:
+        device = torch.device("cuda")
+        print(f"🚀 Using CUDA with {cuda_count} GPU(s)")
+        return device, platform_info
+    
+    # Check MPS (Apple Silicon Metal Performance Shaders)
+    if platform_info["is_apple_silicon"]:
+        try:
+            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                # Additional check: ensure MPS is actually built
+                if torch.backends.mps.is_built():
+                    platform_info["has_mps"] = True
+                    device = torch.device("mps")
+                    print("🍎 Using Apple Silicon MPS (Metal Performance Shaders)")
+                    return device, platform_info
+        except Exception as e:
+            print(f"⚠️  MPS check failed: {e}")
+    
+    # Fall back to CPU
+    if not allow_cpu:
+        raise RuntimeError(
+            "No GPU/accelerator detected. V-JEPA2 encoding requires GPU. "
+            "On Apple Silicon, ensure you have PyTorch >= 1.12 with MPS support."
+        )
+    
+    print("⚠️  Using CPU (encoding will be slow)")
+    return torch.device("cpu"), platform_info
 
 
 def get_encoder(crop_size: int = 256, allow_cpu: bool = True):
@@ -179,7 +252,7 @@ def get_encoder(crop_size: int = 256, allow_cpu: bool = True):
 
     Args:
         crop_size: V-JEPA2 eval crop_size (default 256)
-        allow_cpu: If True, fall back to CPU when no GPU is available
+        allow_cpu: If True, fall back to CPU when no GPU/MPS is available
 
     Returns:
         Tuple of (model, preprocessor, device, torch_module, Image_module)
@@ -195,16 +268,15 @@ def get_encoder(crop_size: int = 256, allow_cpu: bool = True):
 
     torch, Image = _require_imports()
 
-    device_count = torch.cuda.device_count()
-    device = torch.device("cuda" if device_count > 0 else "cpu")
-    if device.type != "cuda":
-        if not allow_cpu:
-            raise RuntimeError(
-                "No CUDA devices detected. V-JEPA2 encoding requires GPU."
-            )
-        print("V-JEPA2 encoder: WARNING - Using CPU (will be slow)")
+    # Select the best available device (CUDA > MPS > CPU)
+    device, platform_info = _select_best_device(torch, allow_cpu)
+    device_count = platform_info["cuda_count"]
+    
+    if device.type == "cpu":
+        print("V-JEPA2 encoder: ⚠️  Using CPU (will be slow)")
 
     # Load preprocessor + model via torch.hub
+    print("Loading V-JEPA2 model from torch.hub (this may take a moment on first run)...")
     preprocessor = torch.hub.load(
         "facebookresearch/vjepa2", "vjepa2_preprocessor", crop_size=crop_size
     )
@@ -212,13 +284,23 @@ def get_encoder(crop_size: int = 256, allow_cpu: bool = True):
         "facebookresearch/vjepa2", "vjepa2_vit_large"
     )
     model = encoder
-    model.eval().to(device)
-
-    if device_count > 1:
-        model = torch.nn.DataParallel(model)
-        print(f"V-JEPA2 encoder: Using DataParallel across {device_count} GPUs")
+    
+    # Move model to device with appropriate dtype for best performance
+    if device.type == "mps":
+        # MPS works best with float32 for model weights
+        # (float16 inference may have issues on some operations)
+        model = model.to(device=device, dtype=torch.float32)
+        model.eval()
+        print("V-JEPA2 encoder: 🍎 Ready on Apple Silicon MPS")
     elif device.type == "cuda":
-        print("V-JEPA2 encoder: Using single GPU")
+        model.eval().to(device)
+        if device_count > 1:
+            model = torch.nn.DataParallel(model)
+            print(f"V-JEPA2 encoder: Using DataParallel across {device_count} GPUs")
+        else:
+            print("V-JEPA2 encoder: Using single CUDA GPU")
+    else:
+        model.eval().to(device)
 
     # Cache for reuse
     _ENCODER_CACHE["model"] = model
@@ -226,6 +308,7 @@ def get_encoder(crop_size: int = 256, allow_cpu: bool = True):
     _ENCODER_CACHE["device"] = device
     _ENCODER_CACHE["torch"] = torch
     _ENCODER_CACHE["Image"] = Image
+    _ENCODER_CACHE["platform_info"] = platform_info
 
     return model, preprocessor, device, torch, Image
 
@@ -284,8 +367,12 @@ def encode_single_clip(
     # Encode
     with torch.inference_mode():
         embedding = model(x)
+    
+    # Synchronize based on device type
     if device.type == "cuda":
         torch.cuda.synchronize()
+    elif device.type == "mps":
+        torch.mps.synchronize()
 
     # Save (squeeze batch dim since we only have one clip)
     _save_embedding(out_path, embedding[0], dtype=dtype)
@@ -385,15 +472,20 @@ def main() -> int:
     # Simple manual batching to keep per-item metadata for saving.
     batches = _batched(clip_items, max(1, args.batch_size))
 
-    # Warm-up: one small forward pass (helps stabilize timing on GPU)
+    # Warm-up: one small forward pass (helps stabilize timing on GPU/MPS)
+    print("Warming up model...")
     warm_item = batches[0][0]
     warm_video_np = _load_clip_as_numpy(warm_item.frame_paths, Image)
     warm_tensor = preprocessor(warm_video_np)[0]  # C x T x H x W
     warm_x = warm_tensor.unsqueeze(0).to(device, non_blocking=True)
     with torch.inference_mode():
         _ = model(warm_x)
+    # Synchronize based on device type
     if device.type == "cuda":
         torch.cuda.synchronize()
+    elif device.type == "mps":
+        torch.mps.synchronize()
+    print("Warm-up complete.")
 
     t0 = time.perf_counter()
     total_clips = 0
@@ -437,8 +529,11 @@ def main() -> int:
         t_e0 = time.perf_counter()
         with torch.inference_mode():
             out = model(x)
+        # Synchronize based on device type
         if device.type == "cuda":
             torch.cuda.synchronize()
+        elif device.type == "mps":
+            torch.mps.synchronize()
         encode_time += time.perf_counter() - t_e0
 
         # Save
@@ -461,11 +556,20 @@ def main() -> int:
 
     total_time = time.perf_counter() - t0
     overall_cps = saved_clips / total_time if total_time > 0 else 0.0
+    # Determine device name for display
+    if device.type == "mps":
+        device_name = "Apple Silicon MPS"
+    elif device.type == "cuda":
+        device_name = f"CUDA ({device_count} GPU{'s' if device_count > 1 else ''})"
+    else:
+        device_name = "CPU"
+    
     print("=" * 60)
     print("V-JEPA2 ENCODING SUMMARY")
     print("=" * 60)
     print(f"Data dir:           {data_dir}")
     print(f"Output mode:        {'in-place (clip_*/feature_maps/)' if in_place_mode else str(out_dir)}")
+    print(f"Device:             {device_name}")
     print(f"Clips discovered:   {len(clip_items)}")
     print(f"Clips saved:        {saved_clips}")
     print(f"Clips skipped:      {skipped_clips}")
@@ -474,19 +578,26 @@ def main() -> int:
     print("--- breakdown (approx wall time) ---")
     print(f"I/O (png decode):   {io_time:.2f} s")
     print(f"Preprocess:         {preprocess_time:.2f} s")
-    print(f"Encode (GPU):       {encode_time:.2f} s")
+    print(f"Encode ({device.type.upper()}):       {encode_time:.2f} s")
     print(f"Save (.npy):        {save_time:.2f} s")
 
     if args.log_json is not None:
         report = {
             "data_dir": str(data_dir),
-            "out_dir": str(out_dir),
+            "out_dir": str(out_dir) if out_dir else "in-place",
             "model": "facebookresearch/vjepa2:vjepa2_vit_large",
             "preprocessor": "facebookresearch/vjepa2:vjepa2_preprocessor",
             "crop_size": args.crop_size,
             "batch_size": args.batch_size,
             "dtype": args.dtype,
-            "device_count": int(device_count),
+            "device": device.type,
+            "device_name": device_name,
+            "device_count": int(device_count) if device.type == "cuda" else 1,
+            "platform": {
+                "system": platform.system(),
+                "machine": platform.machine(),
+                "is_apple_silicon": _ENCODER_CACHE.get("platform_info", {}).get("is_apple_silicon", False),
+            },
             "clips_discovered": int(len(clip_items)),
             "clips_saved": int(saved_clips),
             "clips_skipped": int(skipped_clips),

@@ -77,7 +77,8 @@ import yaml
 # Kubric imports (available inside the Kubric Docker container)
 try:
     import kubric as kb
-    from kubric.renderer.blender import Blender as KubricRenderer
+    # Use patched Blender renderer for Blender 4.x compatibility (OBJ import fix)
+    from experiments.scripts.blender_patched import Blender as KubricRenderer
     from kubric.simulator.pybullet import PyBullet as KubricSimulator
     KUBRIC_AVAILABLE = True
 except ImportError:
@@ -266,14 +267,14 @@ def determine_friction_category(job_id: int, config: dict) -> str:
 
 def determine_mass_mode(job_id: int, config: dict) -> str:
     """
-    Determine if this job uses 'random' or 'fixed' mass.
+    Determine which mass mode this job uses.
 
     Args:
         job_id: The job identifier
         config: Physics configuration dict
 
     Returns:
-        'random' or 'fixed'
+        'normal' (for phases A_1 and A_2) or 'ood' (for phase B)
     """
     # Check phase-based configuration
     if "phase_a1" in config["dataset"]:
@@ -288,8 +289,8 @@ def determine_mass_mode(job_id: int, config: dict) -> str:
         elif phase_a2["range"][0] <= job_id <= phase_a2["range"][1]:
             return phase_a2["mass_mode"]
         else:
-            logger.warning(f"Job ID {job_id} outside defined ranges, defaulting to 'random'")
-            return "random"
+            logger.warning(f"Job ID {job_id} outside defined ranges, defaulting to 'normal'")
+            return "normal"
 
     # No phase configuration found
     raise ValueError(
@@ -330,7 +331,7 @@ def sample_physics_parameters(config: dict, friction_category: str, mass_mode: s
     Args:
         config: Physics configuration dict
         friction_category: 'normal' or 'slippery'
-        mass_mode: 'random' or 'fixed'
+        mass_mode: 'normal' (for A_1/A_2) or 'ood' (for B)
         phase: 'A_1', 'B', or 'A_2'
 
     Returns:
@@ -350,14 +351,11 @@ def sample_physics_parameters(config: dict, friction_category: str, mass_mode: s
         obj_config["size_range"][1]
     )
 
-    # Sample or use fixed mass based on mass_mode
-    if mass_mode == "random":
-        object_mass = np.random.uniform(
-            obj_config["mass_range"][0],
-            obj_config["mass_range"][1]
-        )
-    else:  # fixed
-        object_mass = obj_config.get("mass_fixed", 1.0)
+    # Select mass based on mass_mode (normal for A_1/A_2, ood for B)
+    if mass_mode == "normal":
+        object_mass = obj_config.get("mass_normal", 2.5)
+    else:  # ood (out-of-distribution for phase B)
+        object_mass = obj_config.get("mass_ood", 1.2)
 
     # Sample force vector
     force_config = config["force"]
@@ -380,11 +378,16 @@ def sample_physics_parameters(config: dict, friction_category: str, mass_mode: s
     r, g, b = colorsys.hsv_to_rgb(hue, 0.9, 0.9)
     object_color = (r, g, b, 1.0)  # RGBA
 
+    # Select object type randomly from configured types
+    obj_types = obj_config.get("types", ["cube"])
+    object_type = np.random.choice(obj_types)
+
     parameters = {
         "phase": phase,
         "friction_coefficient": float(friction_coefficient),
         "friction_category": friction_category,
         "mass_mode": mass_mode,
+        "object_type": str(object_type),
         "object_size": float(object_size),
         "object_mass": float(object_mass),
         "force_vector": {
@@ -396,7 +399,7 @@ def sample_physics_parameters(config: dict, friction_category: str, mass_mode: s
         "object_color_rgba": [float(c) for c in object_color],
     }
 
-    logger.info(f"Sampled parameters: phase={phase}, friction={friction_coefficient:.4f}, "
+    logger.info(f"Sampled parameters: phase={phase}, object_type={object_type}, friction={friction_coefficient:.4f}, "
                 f"mass={object_mass:.2f}kg (mode={mass_mode}), force_mag={force_magnitude:.1f}N")
 
     return parameters
@@ -725,34 +728,107 @@ def sample_initial_cube_position_xy(config: dict, cube_size: float) -> tuple[flo
     return start_x, start_y
 
 
-def create_dynamic_cube(scene: "kb.Scene", config: dict, parameters: dict) -> "kb.Cube":
-    """Create the dynamic cube object."""
+def create_dynamic_object(scene: "kb.Scene", config: dict, parameters: dict, scratch_dir: str = None) -> "kb.PhysicalObject":
+    """
+    Create the dynamic object for the scene.
+    
+    Supports multiple object types:
+    - Native Kubric primitives: cube, sphere
+    - KuBasic assets: cylinder, cone, torus, suzanne, teapot, gear, spot, torus_knot, sponge
+    
+    Args:
+        scene: The Kubric scene
+        config: Physics configuration dict
+        parameters: Sampled physics parameters (includes object_type)
+        scratch_dir: Directory for KuBasic asset source (optional)
+    
+    Returns:
+        The created physical object
+    """
     size = parameters["object_size"]
     color = parameters["object_color_rgba"]
+    object_type = parameters.get("object_type", "cube")
 
     # Random starting position (near center, exactly resting on floor)
     start_x, start_y = sample_initial_cube_position_xy(config, cube_size=size)
     start_z = size / 2  # Exactly resting on floor (no gap = no settling)
 
-    cube = kb.Cube(
-        name="dynamic_cube",
-        scale=(size, size, size),
-        position=(start_x, start_y, start_z),
-        velocity=(0, 0, 0),
-        static=False,
-        mass=parameters["object_mass"],
-    )
+    # Native Kubric primitives (cube and sphere)
+    if object_type == "cube":
+        obj = kb.Cube(
+            name="dynamic_object",
+            scale=(size, size, size),
+            position=(start_x, start_y, start_z),
+            velocity=(0, 0, 0),
+            static=False,
+            mass=parameters["object_mass"],
+        )
+    elif object_type == "sphere":
+        obj = kb.Sphere(
+            name="dynamic_object",
+            scale=(size, size, size),
+            position=(start_x, start_y, start_z),
+            velocity=(0, 0, 0),
+            static=False,
+            mass=parameters["object_mass"],
+        )
+    else:
+        # Use KuBasic asset source for complex shapes
+        # Map object type names to KuBasic asset IDs
+        kubasic_asset_ids = {
+            "cylinder": "cylinder",
+            "cone": "cone",
+            "torus": "torus",
+            "suzanne": "suzanne",
+            "teapot": "teapot",
+            "gear": "gear",
+            "spot": "spot",
+            "torus_knot": "torus_knot",
+            "sponge": "sponge",
+        }
+        
+        asset_id = kubasic_asset_ids.get(object_type)
+        if asset_id is None:
+            logger.warning(f"Unknown object type '{object_type}', falling back to cube")
+            obj = kb.Cube(
+                name="dynamic_object",
+                scale=(size, size, size),
+                position=(start_x, start_y, start_z),
+                velocity=(0, 0, 0),
+                static=False,
+                mass=parameters["object_mass"],
+            )
+        else:
+            # Load KuBasic asset source
+            kubasic = kb.AssetSource.from_manifest(
+                "gs://kubric-public/assets/KuBasic/KuBasic.json"
+            )
+            
+            # Create object from asset
+            obj = kubasic.create(
+                asset_id=asset_id,
+                name="dynamic_object",
+                scale=size,
+            )
+            
+            # Set physical properties
+            obj.position = (start_x, start_y, start_z)
+            obj.velocity = (0, 0, 0)
+            obj.static = False
+            obj.mass = parameters["object_mass"]
 
-    cube.friction = parameters["friction_coefficient"]
+    # Set friction
+    obj.friction = parameters["friction_coefficient"]
 
-    cube.material = kb.PrincipledBSDFMaterial(
-        name="cube_material",
+    # Apply material
+    obj.material = kb.PrincipledBSDFMaterial(
+        name="object_material",
         color=kb.Color(*color[:3]),
         metallic=0.1,
         roughness=0.7,
     )
 
-    scene.add(cube)
+    scene.add(obj)
 
     # Store initial position in parameters
     parameters["initial_position"] = {
@@ -761,15 +837,24 @@ def create_dynamic_cube(scene: "kb.Scene", config: dict, parameters: dict) -> "k
         "z": float(start_z)
     }
 
-    logger.info(f"Created cube: size={size:.3f}, mass={parameters['object_mass']:.2f}kg, "
+    logger.info(f"Created {object_type}: size={size:.3f}, mass={parameters['object_mass']:.2f}kg, "
                 f"pos=({start_x:.2f}, {start_y:.2f}, {start_z:.2f})")
 
-    return cube
+    return obj
+
+
+# Keep the old function name as an alias for backwards compatibility
+def create_dynamic_cube(scene: "kb.Scene", config: dict, parameters: dict) -> "kb.Cube":
+    """Create the dynamic cube object (deprecated, use create_dynamic_object instead)."""
+    # Force cube type for backwards compatibility
+    parameters_copy = parameters.copy()
+    parameters_copy["object_type"] = "cube"
+    return create_dynamic_object(scene, config, parameters_copy)
 
 
 def apply_force_impulse_during_simulation(
     simulator: "KubricSimulator",
-    cube: "kb.Cube",
+    obj: "kb.PhysicalObject",
     config: dict,
     parameters: dict,
     scene: "kb.Scene"
@@ -791,7 +876,7 @@ def apply_force_impulse_during_simulation(
     the correct timestep.
 
     Returns:
-        np.ndarray: Cube positions (x, y) for each frame, shape (T, 2)
+        np.ndarray: Object positions (x, y) for each frame, shape (T, 2)
     """
     import pybullet as p
 
@@ -799,8 +884,8 @@ def apply_force_impulse_during_simulation(
     mass = parameters["object_mass"]
     apply_frame = config["force"]["apply_at_frame"]
 
-    # Get PyBullet body ID for the cube
-    body_id = cube.linked_objects[simulator]
+    # Get PyBullet body ID for the dynamic object
+    body_id = obj.linked_objects[simulator]
     # physics_client property returns the raw pybullet client ID
     physics_client = simulator.physics_client
 
@@ -930,16 +1015,16 @@ def apply_force_impulse_during_simulation(
 
     logger.info(f"Simulation complete. Recorded {frame_end - frame_start + 1} keyframes.")
 
-    # Extract cube positions (x, y) for each frame for ground_truth_states.npy
-    cube_positions = animation[cube]["position"]  # List of (x, y, z) tuples
-    cube_positions_xy = np.array([[pos[0], pos[1]] for pos in cube_positions])  # Shape: (T, 2)
+    # Extract object positions (x, y) for each frame for ground_truth_states.npy
+    object_positions = animation[obj]["position"]  # List of (x, y, z) tuples
+    object_positions_xy = np.array([[pos[0], pos[1]] for pos in object_positions])  # Shape: (T, 2)
 
-    return cube_positions_xy
+    return object_positions_xy
 
 
 def save_states_and_actions(
     actions_states_dir: Path,
-    cube_positions_xy: np.ndarray,
+    object_positions_xy: np.ndarray,
     parameters: dict,
     config: dict
 ) -> None:
@@ -948,7 +1033,7 @@ def save_states_and_actions(
 
     Args:
         actions_states_dir: Path to the actions_states directory
-        cube_positions_xy: Cube positions (x, y) for each frame, shape (T, 2)
+        object_positions_xy: Object positions (x, y) for each frame, shape (T, 2)
         parameters: Sampled physics parameters (contains force_vector)
         config: Physics configuration (contains apply_at_frame and num_frames)
     """
@@ -956,8 +1041,8 @@ def save_states_and_actions(
     apply_frame = config["force"]["apply_at_frame"]
     force_vector = parameters["force_vector"]
 
-    # States: cube positions (x, y) for each frame - already computed
-    states = cube_positions_xy  # Shape: (T, 2)
+    # States: object positions (x, y) for each frame - already computed
+    states = object_positions_xy  # Shape: (T, 2)
 
     # Actions: force applied at each frame (mostly zeros, only apply_frame has force)
     actions = np.zeros((num_frames, 2), dtype=np.float32)
@@ -1077,6 +1162,7 @@ def save_ground_truth(
         "job_id": job_id,
         "global_seed": seed,
         "job_seed": job_seed,
+        "phase": parameters["phase"],
         "friction_category": parameters["friction_category"],
         "physics": {
             "friction_coefficient": parameters["friction_coefficient"],
@@ -1094,7 +1180,7 @@ def save_ground_truth(
             "velocity": {"x": 0.0, "y": 0.0, "z": 0.0},
         },
         "object": {
-            "type": "cube",
+            "type": parameters.get("object_type", "cube"),
             "color_rgba": parameters["object_color_rgba"],
         },
         "camera": camera_info,
@@ -1232,8 +1318,8 @@ def generate_clip(
     # Create floor
     floor = create_floor(scene, config, parameters)
 
-    # Create dynamic object
-    cube = create_dynamic_cube(scene, config, parameters)
+    # Create dynamic object (supports multiple object types)
+    dynamic_object = create_dynamic_object(scene, config, parameters)
 
     # IMPORTANT: Setup renderer BEFORE simulator
     # The renderer must be created before simulation so it can observe keyframe changes
@@ -1262,15 +1348,15 @@ def generate_clip(
 
     # Run simulation with force impulse applied between frame 1 and 2
     # This function handles the phased simulation internally with proper keyframe recording
-    # Returns cube positions (x, y) for each frame
-    cube_positions_xy = apply_force_impulse_during_simulation(simulator, cube, config, parameters, scene)
+    # Returns object positions (x, y) for each frame
+    object_positions_xy = apply_force_impulse_during_simulation(simulator, dynamic_object, config, parameters, scene)
 
     # Note: simulation is now complete with all keyframes properly transferred to Blender
 
     # Save states and actions arrays
     save_states_and_actions(
         directories["actions_states"],
-        cube_positions_xy,
+        object_positions_xy,
         parameters,
         config
     )
